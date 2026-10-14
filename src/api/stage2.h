@@ -1,0 +1,110 @@
+/* Copyright 2026 Erik Branger.
+   This file is part of gpuecm2, distributed under the GNU Lesser General Public
+   License, version 3 or later. See COPYING.LESSER and COPYING.
+
+   ECM stage 2 on the GPU with GMP-ECM's algorithm and parameters, for one
+   curve or a batch of curves at a time. One engine per modulus and parameter
+   set (it holds the NTT primes and the root plans); run() / run_batch() may
+   be called for many curves. Batches give the GPU enough parallel work when
+   a single curve's stage 2 is small (small B1). */
+#pragma once
+#include <map>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <gmp.h>
+
+#include "gpu/rns.h"
+#include "gpu/roots.h"
+#include "host/params.h"
+#include "host/roots_plan.h"
+
+struct Stage2Times {  // seconds, for the whole batch
+  double rootsF = 0, treeF = 0, invF = 0, rootsG = 0, treesG = 0, mulmod = 0, eval = 0, prod = 0, total = 0;
+  size_t batch = 1;  // curves that shared these times
+};
+
+struct Stage2Outcome {
+  int status = 0;    // 0: no factor, 2: factor found (in factor; may equal n), -1: error
+  bool check_failed = false;  // the self-check found an inconsistency (status -1)
+  Z factor;
+  Z first_value;     // H(-f_0), what GMP-ECM prints as "Product of G(f_i)" at -v -v
+  bool have_first = false;
+  Stage2Times t;
+};
+
+/* How the CPU waits for the GPU: false (default) sleeps until the GPU is
+   done, leaving the core to other work such as CPU stage 1; true
+   busy-waits (a full core, slightly lower latency). Call before any other
+   GPU work. */
+void stage2_cpu_wait(bool spin);
+
+/* Rough upper estimate of the GPU memory (bytes) a stage 2 run of `batch`
+   curves needs. */
+size_t stage2_gpu_bytes(const mpz_t n, const Stage2Params &sp, size_t batch = 1);
+/* Free GPU memory that may be used (a margin is kept for the display etc.). */
+size_t stage2_gpu_budget();
+/* A batch size for this modulus and these parameters: enough curves to keep
+   the GPU busy, as far as budget (bytes) allows; 1 when one curve suffices. */
+size_t stage2_auto_batch(const mpz_t n, const Stage2Params &sp, size_t budget);
+/* The largest batch size up to want that fits in budget (at least 1). */
+size_t stage2_max_batch(const mpz_t n, const Stage2Params &sp, size_t budget, size_t want);
+/* GMP-ECM's stage 2 parameters for req (compute_stage2_params); if they
+   need more GPU memory than budget (bytes; 0: do not check), the parameters
+   GMP-ECM would choose with the smallest larger -k that fits (more, smaller
+   blocks, still covering B2). *raised tells whether that happened. Returns
+   false with a message in *err if GMP-ECM reports an error or nothing fits. */
+bool stage2_params_for_gpu(Stage2Params &sp, const Stage2Request &req, const mpz_t n, size_t budget, bool *raised,
+                           std::string *err);
+
+class Stage2Engine {
+ public:
+  Stage2Engine(const mpz_t n, const Stage2Params &sp);
+  ~Stage2Engine();
+  Stage2Engine(const Stage2Engine &) = delete;
+  Stage2Engine &operator=(const Stage2Engine &) = delete;
+  bool ok() const { return ok_; }
+  const std::string &error() const { return err_; }
+  const RnsContext &rns() const { return ctx_; }
+  /* C: the curve and the stage 1 point.
+     timed: synchronise between phases so that the times are meaningful
+     (this also turns off the overlap of root generation and polynomial
+     arithmetic).
+     selfcheck: verify F(r) = prod (r + f_i) and G(r) = prod (r + g_i) for
+     every product tree at a random r, and the final values H(-f_i) =
+     prod_{blocks, j} (g_j - f_i) at a few random roots f_i of F (reduction
+     mod F does not change values at its roots, so this covers the
+     products mod F and the evaluation as well). Costs a few percent. */
+  Stage2Outcome run(const MontgomeryCurve &C, bool timed, bool selfcheck = false) {
+    return run_batch(&C, 1, timed, selfcheck)[0];
+  }
+  /* Stage 2 for count curves (same n) at once; one outcome per curve, each
+     exactly as run() would give it. If root generation meets a
+     non-invertible value, the curves are redone one by one to find out
+     which curve it belongs to (rare). The times are those of the batch. */
+  std::vector<Stage2Outcome> run_batch(const MontgomeryCurve *C, size_t count, bool timed, bool selfcheck = false);
+
+ private:
+  Z n_;
+  Stage2Params sp_;
+  RnsContext ctx_;
+  double jmax_ = 0, imax_ = 0;  // largest arguments of the F and G roots
+  size_t cap_ = 0;              // point additions per wave (root generation)
+  /* root plans (on the GPU) per batch size: the number of progressions per
+     curve depends on how many curves share the GPU */
+  struct Plans {
+    ProgressionPlan F, G;
+    std::unique_ptr<RootPlanGPU> gF, gG;
+    size_t scalar_bits = 1;  // largest root scalar of both plans
+  };
+  std::map<size_t, std::unique_ptr<Plans>> plans_;
+  const Plans &plans_for(size_t batch);
+  /* polynomial arithmetic and root generation run on separate streams, so
+     that the roots of the next block of G are computed while the current
+     one is processed */
+  cudaStream_t s_poly_ = nullptr, s_roots_ = nullptr;
+  cudaEvent_t ev_[5] = {};  // F roots done, G block roots done (2), G block consumed (2)
+  bool ok_ = false;
+  std::string err_;
+};

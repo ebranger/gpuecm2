@@ -1,0 +1,5 @@
+/* symbols exported by libgpuecm2 (the C interface in gpuecm2.h) */
+{
+  global: gpuecm2_*;
+  local: *;
+};

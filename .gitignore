@@ -1,0 +1,5 @@
+build*/
+__pycache__/
+*.pyc
+boundary_cache/
+b2_tradeoff.json
