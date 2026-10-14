@@ -181,6 +181,56 @@ With one GPU doing both stages, gpuecm2's stage 2 at the default B2 takes 0.1–
 stage 1, about the same share as stage 2 has on the CPU (0.1–0.7). The default B2 is
 therefore about as well balanced on the GPU as it is on the CPU.
 
+## GPU only against GPU stage 1 with CPU stage 2
+
+The usual way to use a GPU with GMP-ECM so far is GPU stage 1 followed by stage 2 of the
+saved residues on CPU cores. With gpuecm2 both stages run on the GPU, one after the other
+(running them concurrently does not help: each keeps the GPU busy on its own, see below).
+Time per curve, from the measurements above; "GPU stage 1 + 20 cores" assumes that 20 CPU
+cores run stage 2 while the GPU runs stage 1 of the next curves, with perfect scaling over the
+cores (optimistic: on the test machine eight parallel `ecm` processes each ran 1.5–1.7 times
+slower than one alone), so that per curve it takes the larger of the two:
+
+| N bits | B1 | GPU stage 1 | GPU stage 2 | GPU only | CPU stage 2 (one core) | GPU stage 1 + 20 cores of CPU stage 2 | GPU only faster by |
+|---|---|---|---|---|---|---|---|
+| 512 | 1e6 | 7.9 ms | 2.8 ms | 11 ms | 473 ms | 24 ms | 2.2× |
+| 512 | 3e6 | 24 ms | 6.4 ms | 30 ms | 1.1 s | 54 ms | 1.8× |
+| 512 | 11e6 | 87 ms | 20 ms | 107 ms | 3.3 s | 167 ms | 1.6× |
+| 512 | 43e6 | 340 ms | 59 ms | 399 ms | 10.0 s | 502 ms | 1.3× |
+| 512 | 11e7 | 869 ms | 157 ms | 1.0 s | 24.4 s | 1.2 s | 1.2× |
+| 1024 | 1e6 | 13 ms | 7.0 ms | 20 ms | 1.0 s | 52 ms | 2.6× |
+| 1024 | 3e6 | 39 ms | 16 ms | 55 ms | 2.3 s | 114 ms | 2.1× |
+| 1024 | 11e6 | 143 ms | 50 ms | 193 ms | 7.4 s | 370 ms | 1.9× |
+| 1024 | 43e6 | 559 ms | 146 ms | 705 ms | 22.2 s | 1.1 s | 1.6× |
+| 1024 | 11e7 | 1.4 s | 375 ms | 1.8 s | 57.0 s | 2.9 s | 1.6× |
+| 2048 | 1e6 | 45 ms | 17 ms | 61 ms | 2.1 s | 106 ms | 1.7× |
+| 2048 | 3e6 | 134 ms | 43 ms | 177 ms | 5.8 s | 290 ms | 1.6× |
+| 2048 | 11e6 | 491 ms | 150 ms | 642 ms | 21.4 s | 1.1 s | 1.7× |
+| 2048 | 43e6 | 1.9 s | 379 ms | 2.3 s | 55.7 s | 2.8 s | 1.2× |
+| 2048 | 11e7 | 4.9 s | 1.2 s | 6.1 s | 198 s | 9.9 s | 1.6× |
+| 4095 | 1e6 | 119 ms | 51 ms | 170 ms | 5.3 s | 264 ms | 1.6× |
+| 4095 | 3e6 | 358 ms | 135 ms | 492 ms | 15.3 s | 766 ms | 1.6× |
+| 4095 | 11e6 | 1.3 s | 456 ms | 1.8 s | 59.1 s | 3.0 s | 1.7× |
+| 4095 | 43e6 | 5.1 s | 1.2 s | 6.3 s | 157 s | 7.8 s | 1.2× |
+| 4095 | 11e7 | 13.1 s | 4.0 s | 17.2 s | 655 s | 32.8 s | 1.9× |
+
+In the hybrid setup the CPU limits the throughput everywhere: keeping up with GPU stage 1 at
+GMP-ECM's default B2 would need 40 to 60 cores. GPU only is 1.2–2.6 times faster than the
+GPU with 20 cores, and leaves the CPU free.
+
+End to end, `ecm -gpu2` (GMP-ECM 7.0.6 with the integration described in
+docs/INTEGRATION.md) for 4224 curves of RSA-1024 at B1 = 3e6 took 260.3 s (61.6 ms per
+curve): 43.2 ms of GPU stage 1 and 18.4 ms of GPU stage 2 per curve (both about 10% slower
+than the separate measurements above, the GPU was partly in use by the desktop); the rest of
+GMP-ECM's work per run is negligible.
+
+Running stage 2 of one batch of curves concurrently with stage 1 of the next (in two
+threads of one process; separate processes do not run concurrently on a GPU under Windows)
+was tried: for 3 × 4224 curves of RSA-1024 at B1 = 1e6 it took 272 s against 263 s one after
+the other (283 s with stage 1 at the higher stream priority). Stage 1's kernels occupy every
+SM for about 100 ms at a time and stage 2 then gets almost no share, and batched stage 2 alone
+keeps the GPU busy 97.5% of the time, so there is no idle time to fill.
+
 ## Choosing B2 when stage 2 runs on the GPU
 
 The expected time to find a factor of the targeted size is curves × (stage 1 + stage 2)
