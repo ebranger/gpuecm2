@@ -1,0 +1,78 @@
+From 74c34e757e55a536375febb03254602095e881d7 Mon Sep 17 00:00:00 2001
+From: Erik Branger <erik.branger@physics.uu.se>
+Date: Wed, 14 Oct 2026 20:28:09 +0200
+Subject: [PATCH 2/2] GPU stage 1: CGBN kernels of 768, 1280, 2560 and 4608
+ bits
+
+GMP-ECM 7.0.6 has kernels of 512, 1024, 1536, 2048, 3072 and 4096 bits and
+needs bits(N) + 6 <= BITS, so a 512-bit number used the 1024-bit kernel, a
+2048-bit number the 3072-bit one, and numbers of 4091 bits and more could not
+be run. The added sizes are 20-30% faster for such numbers and allow up to
+4602 bits. ECM_CGBN_BITS=b selects the kernel of b bits (for comparisons).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ cgbn_stage1.cu | 31 +++++++++++++++++++++++++++----
+ 1 file changed, 27 insertions(+), 4 deletions(-)
+
+diff --git a/cgbn_stage1.cu b/cgbn_stage1.cu
+index 77e66ef..84bab32 100644
+--- a/cgbn_stage1.cu
++++ b/cgbn_stage1.cu
+@@ -733,10 +733,18 @@ int cgbn_ecm_stage1(mpz_t *factors, int *array_found,
+   typedef cgbn_params_t<8, 2048>  cgbn_params_2048;
+   typedef cgbn_params_t<16, 3072> cgbn_params_3072;
+   typedef cgbn_params_t<16, 4096> cgbn_params_4096;
+-  available_kernels.push_back((uint32_t)cgbn_params_1536::BITS);
+-  available_kernels.push_back((uint32_t)cgbn_params_2048::BITS);
+-  available_kernels.push_back((uint32_t)cgbn_params_3072::BITS);
+-  available_kernels.push_back((uint32_t)cgbn_params_4096::BITS);
++  /* Sizes in between, so that numbers just above a power of two get a kernel
++     close to their size (a 512-bit N needs at least 518 bits); only sizes
++     whose limb count is a multiple of TPI (CGBN's division code, used by
++     bn2mont, does not support the others). With 4608 bits, numbers up to 4602
++     bits can be used. */
++  typedef cgbn_params_t<8, 768>   cgbn_params_768;
++  typedef cgbn_params_t<8, 1280>  cgbn_params_1280;
++  typedef cgbn_params_t<16, 2560> cgbn_params_2560;
++  typedef cgbn_params_t<16, 4608> cgbn_params_4608;
++  available_kernels.clear();
++  for (uint32_t b : {512u, 768u, 1024u, 1280u, 1536u, 2048u, 2560u, 3072u, 4096u, 4608u})
++    available_kernels.push_back(b);
+ #endif
+ 
+   /* Pointer to CUDA kernel. */
+@@ -744,8 +752,11 @@ int cgbn_ecm_stage1(mpz_t *factors, int *array_found,
+         uint32_t*, uint32_t*, uint32_t, uint32_t, uint32_t) = NULL;
+ 
+   size_t n_log2 = mpz_sizeinbase(N, 2);
++  /* ECM_CGBN_BITS=b uses only the kernel of b bits (for comparisons) */
++  const char *force_bits = getenv("ECM_CGBN_BITS");
+   for (int k_i = 0; k_i < available_kernels.size(); k_i++) {
+     uint32_t kernel_bits = available_kernels[k_i];
++    if (force_bits != NULL && kernel_bits != (uint32_t)atoi(force_bits)) continue;
+     if (kernel_bits >= n_log2 + CARRY_BITS) {
+       BITS = kernel_bits;
+       assert( BITS % 32 == 0 );
+@@ -771,6 +782,18 @@ int cgbn_ecm_stage1(mpz_t *factors, int *array_found,
+       } else if (BITS == cgbn_params_4096::BITS) {
+         TPI = cgbn_params_4096::TPI;
+         kernel = kernel_double_add<cgbn_params_4096>;
++      } else if (BITS == cgbn_params_768::BITS) {
++        TPI = cgbn_params_768::TPI;
++        kernel = kernel_double_add<cgbn_params_768>;
++      } else if (BITS == cgbn_params_1280::BITS) {
++        TPI = cgbn_params_1280::TPI;
++        kernel = kernel_double_add<cgbn_params_1280>;
++      } else if (BITS == cgbn_params_2560::BITS) {
++        TPI = cgbn_params_2560::TPI;
++        kernel = kernel_double_add<cgbn_params_2560>;
++      } else if (BITS == cgbn_params_4608::BITS) {
++        TPI = cgbn_params_4608::TPI;
++        kernel = kernel_double_add<cgbn_params_4608>;
+ #endif
+       } else {
+         outputf (OUTPUT_ERROR, "CGBN kernel not found for %d bits\n", BITS);
+-- 
+2.53.0
+

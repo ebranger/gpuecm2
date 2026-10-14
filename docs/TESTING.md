@@ -15,6 +15,7 @@ implementation changes behaviour (boundary tests).
 | `tests/compare_params.py` | GMP-ECM | 10 min | the parameter lines (`dF`, `k`, `d`, `d2`, `i0`, polynomial) for a grid of sizes, B1, B2 and options |
 | `tests/check_curves.py` | GMP-ECM | 5 min | the curve setup of parametrizations 0-3 |
 | `test_roots <ecm>` | GPU, GMP-ECM | 1 min | every root of F and G against GMP-ECM's own (`-v -v -v -v -v`), also with G produced block by block |
+| `gmp-ecm/test_gpu2.py` | GPU, the `ecm` of `gmp-ecm/build_ecm.sh` | 3 min | the full GPU build of GMP-ECM: `-gpu2` gives the same result as GMP-ECM's CPU stage 2 for every curve of a GPU stage 1 run (512, 1024 and 2048 bits) |
 
 "Same results" means the same factor, or the same `Product of G(f_i)` value that GMP-ECM
 prints at `-v -v` when no factor is found. That value is H(-f_0), which depends on every root

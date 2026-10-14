@@ -61,12 +61,15 @@ gpuecm2_params_clear(p);
 stage 2 for a GMP-ECM save file through the interface only (it is also used by the tests:
 `tests/run_hits.py build/capi_resume` reproduces the known hits through the library).
 
-## Where GMP-ECM would call it
+## Where GMP-ECM calls it
 
 The following describes the two places in GMP-ECM 7.0.x where its CPU stage 2 is called.
-A patch would add a configure option (say `--with-gpuecm2=DIR`, defining `HAVE_GPUECM2`
-and linking `-lgpuecm2`) and a command line option (say `-gpu2`) that selects the GPU
-stage 2.
+The first is implemented for GMP-ECM 7.0.6 by [`gmp-ecm/0001-gpu2.patch`](../gmp-ecm/0001-gpu2.patch)
+(function `stage2_gpuecm2` in `cudawrapper.c`): built with `-DHAVE_GPUECM2` and linked with
+`-lgpuecm2`, `ecm` gets the option `-gpu2`. [`gmp-ecm/build_ecm.sh`](../gmp-ecm/build_ecm.sh)
+makes such a build; see [gmp-ecm/README.md](../gmp-ecm/README.md) and the README's
+"Full GPU build of GMP-ECM". The second is not patched: for CPU stage 1 the standalone
+`gpuecm2 -resume` serves.
 
 1. **GPU stage 1 (`-gpu`), `cudawrapper.c`, `gpu_ecm()`.** After stage 1 on the GPU, a loop
    over the `nb_curves` curves sets `P.x` to the curve's result, `P.A` from its sigma
@@ -85,7 +88,7 @@ stage 2.
      /* then report as the existing loop does: status[i] == GPUECM2_FACTOR_FOUND
         means a factor factors[i] in step 2 with curve i */
    }
-   /* else (e.g. not enough GPU memory): the existing CPU loop */
+   /* else: parameters with a larger k that fit (see below), or the existing CPU loop */
    ```
 
    Here the batch matters most: GPU stage 1 produces thousands of curves of one number, and
@@ -103,7 +106,8 @@ stage 2.
 In both places GMP-ECM's own dF, k and root parameters are passed unchanged, so the GPU
 covers exactly the primes the CPU would. If `gpuecm2_stage2_new` returns NULL because dF
 does not fit in the GPU memory, `gpuecm2_choose_params` with the same B1, B2 and options
-gives the parameters GMP-ECM would choose with the smallest `-k` that fits.
+gives the parameters GMP-ECM would choose with the smallest `-k` that fits; the `-gpu2` patch
+does this, and uses the CPU loop only if that fails too.
 
 GMP-ECM's verbose output that depends on stage 2 internals ("Product of G(f_i)" at `-v -v`)
 is available as the `value` output of `gpuecm2_stage2_run`.

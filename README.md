@@ -34,8 +34,16 @@ is gpuecm2 with the curves of a GPU stage 1 run processed together. From B1 = 26
 programs ran with `-maxmem 8000`. Other sizes (512 to 4096 bits, the same speedup of 100–200×
 from B1 = 3e6 on) are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
-It is also a library with a C interface for programs that do stage 1 themselves; see
-[docs/INTEGRATION.md](docs/INTEGRATION.md) for how GMP-ECM can use it.
+gpuecm2 can be used in two ways:
+
+- **The `gpuecm2` program** (built by default): stage 2 of residues saved by any GMP-ECM
+  run, a drop-in replacement for `ecm -resume`. Nothing else is changed.
+- **GMP-ECM with GPU stage 1 and stage 2 in one run** (optional): `gmp-ecm/` holds patches
+  for GMP-ECM 7.0.6 that add the option `-gpu2`, and a script that builds such an `ecm`
+  linked to gpuecm2's library; see [Full GPU build of GMP-ECM](#full-gpu-build-of-gmp-ecm).
+
+The library has a C interface for other programs as well; see
+[docs/INTEGRATION.md](docs/INTEGRATION.md).
 
 ## Usage
 
@@ -93,6 +101,45 @@ in about a minute.
 On Windows, use the MSVC toolchain with GMP from vcpkg (`-DGMP_ROOT=...`); the library is then
 built as a static library.
 
+## Full GPU build of GMP-ECM
+
+Optional, in addition to the above: GMP-ECM 7.0.6 with its GPU stage 1 and gpuecm2's stage 2,
+so that a whole ECM run happens on the GPU. It needs the gpuecm2 build above, the CUDA
+toolkit, GMP and an internet connection (for the GMP-ECM release).
+
+```
+gmp-ecm/build_ecm.sh                        # makes build-gmp-ecm/ecm-7.0.6/ecm
+python3 gmp-ecm/test_gpu2.py                # checks it against GMP-ECM's CPU stage 2 (a few minutes)
+```
+
+`build_ecm.sh` downloads the GMP-ECM 7.0.6 release, checks its checksum, applies the patches in
+`gmp-ecm/` and builds `ecm` with GPU support for the GPU in the machine (`--arch NN` for
+another compute capability, `--gpuecm2 DIR` for an installed gpuecm2, `--no-kernel-sizes` to
+leave GMP-ECM's GPU stage 1 kernels as they are; see [gmp-ecm/README.md](gmp-ecm/README.md)).
+The patches are under the GPL, like GMP-ECM; see that file.
+
+Usage is that of GMP-ECM's `-gpu` with one more option:
+
+```
+echo "<number>" | build-gmp-ecm/ecm-7.0.6/ecm -gpu2 [-gpucurves n] [-sigma 3:s] [-v] B1 [B2]
+```
+
+- `-gpu2` implies `-gpu`: stage 1 of a batch of curves (parametrization 3; `-gpucurves`
+  curves, by default as many as fill the GPU) runs on the GPU, then stage 2 of all of them on
+  the GPU, with GMP-ECM's stage 2 parameters. Factors are reported as with `-gpu` ("GPU: factor
+  ... found in Step 2 with curve i"), and `-v` reports "Computing n Step 2 on GPU took ...ms".
+- Everything else works as with `-gpu`: `-c`, `-save`/`-savea` (the stage 1 residues),
+  `-maxmem`, `-k`, `-power`/`-dickson`, input files, `-one`, and so on.
+- If GMP-ECM's dF does not fit in the free GPU memory, stage 2 uses the parameters GMP-ECM
+  chooses with the smallest larger `-k` that fits (more, smaller blocks covering the same B2),
+  with a message, as the standalone `gpuecm2` does. If gpuecm2 cannot run the stage 2 at all,
+  GMP-ECM's CPU stage 2 is used, with a message.
+- With the kernel-size patch, numbers of up to 4602 bits can use GPU stage 1 (GMP-ECM 7.0.6
+  alone stops at 4090 bits); `ECM_CGBN_BITS=b` forces the stage 1 kernel of b bits.
+
+Stage 1 and stage 2 run one after the other: on a GPU both keep it fully busy, and running
+them concurrently was measured to be slower (docs/BENCHMARKS.md).
+
 ## Tests
 
 [docs/TESTING.md](docs/TESTING.md) describes the tests. In short:
@@ -111,4 +158,6 @@ Benchmarks are in `bench/`: `bench_stage2` (complete stage 2), `bench_poly`, `be
 
 GNU Lesser General Public License, version 3 or later (`COPYING.LESSER`, `COPYING`).
 Parts are ported from GMP-ECM (LGPL-3+; resume-file parsing follows GMP-ECM's MIT-licensed
-resume.c). CGBN is under its own MIT-style license (`third_party/cgbn/LICENSE`).
+resume.c). CGBN is under its own MIT-style license (`third_party/cgbn/LICENSE`). The patches
+for GMP-ECM in `gmp-ecm/` modify GPL files of GMP-ECM and are under the GNU General Public
+License, version 3 or later, like the `ecm` program they produce (see `gmp-ecm/README.md`).
