@@ -13,8 +13,9 @@ time than GMP-ECM on one core of an i7-14700F, for numbers of 512 to 4096 bits a
 3e6 up (e.g. 16 ms instead of 2.3 s for a 1024-bit number at B1 = 3e6, 4.0 s instead of 655 s
 for 4096 bits at B1 = 11e7); see [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
-Per curve, for 1024-bit numbers and the B1 values of GMP-ECM's table (with GMP-ECM's
-default B2), on an RTX 4070 Ti SUPER and one core of an i7-14700F:
+For a 1024-bit number and the B1 values from GMP-ECM's table (with GMP-ECM's
+default B2), on an RTX 4070 Ti SUPER and one core of an i7-14700F the following timings were
+obtained, where values are average time for one curve in cases several are batched together:
 
 | Factor size | B1 | B2 (GMP-ECM default) | GPU stage 1 | CPU stage 2 | GPU stage 2 | Stage 2 speedup |
 |---|---|---|---|---|---|---|
