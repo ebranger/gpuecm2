@@ -58,18 +58,34 @@ The C interface is shaped so that GMP-ECM can call it from its per-curve stage 2
   - Primes, twiddles and CRT tables are computed once per N and shared by all curves.
 - **NTT:** batched four-step / radix-8 kernels with twiddles in shared memory
   (prototype: gpu-s2-bench/ntt31v2.cu, 2.2–2.6e11 butterflies/s on an RTX 4070 Ti SUPER).
+  - Rows of up to 4096 points (`kRow`, also the second pass of the four-step transforms) are
+    done in shared memory with 8 elements per thread. The stride-1 pass (the last of a
+    forward transform, the first of an inverse one) holds 8 contiguous elements per thread,
+    loaded and stored as two 16-byte vectors; the exchanges between passes use an XOR
+    swizzle and the twiddles are stored per level, so there are no bank conflicts. Both
+    passes run at about 80% of DRAM bandwidth (Nsight Compute), a transform of 2^18 points
+    within 10% of cuFFT's FP32 transform of the same number of bytes.
+  - Operands are zero-padded to twice their length: the first pass of the forward transform
+    takes the padding (and the leading 1 of a monic operand) as given instead of reading it,
+    so it is never written. The pointwise products (plain, adjacent pairs in the product
+    tree, sibling swaps in the evaluation) are formed while the first pass of the inverse
+    transform loads its input.
 - **Conversions:** direct reduction (limbs × table of 2^(32j) mod p) and explicit CRT back to mod N.
   - Both are matrix products over the coefficients, P × nl multiply-adds per coefficient
     each way (P ≈ 2·nl primes), and they dominate the polynomial arithmetic for large N.
-  - Limbs → RNS is a tiled matrix product: each thread computes 3–4 primes × 4 coefficients
-    from operands staged in shared memory 16 limbs at a time (1.6–2.0 T multiply-adds/s on
-    an RTX 4070 Ti SUPER from 2048 bits up; 2.0 ns per coefficient at 1024 bits, 22 ns at
-    4096).
-  - RNS → limbs uses the same tiling for the column sums of 32 coefficients, kept in shared
-    memory, followed by the CRT completion (alpha, carries, reduction mod N) in the same
-    block, from 993 to 3552 bits; outside that range one dot product per thread is faster
-    (the column sums would leave room for only one block per SM). 2.3 ns per coefficient at
-    1024 bits, 45 ns at 4096. `bench/bench_conv` measures both directions.
+  - Limbs → RNS is a tiled matrix product: each thread computes 2–4 primes × 4 coefficients
+    from operands staged in shared memory 16 limbs at a time, with registers capped for 3–4
+    blocks per SM (latency bound otherwise): 1.7 ns per coefficient at 1024 bits, 3.9 at
+    2048, 14 at 4096 (up to 2.3 T multiply-adds/s on an RTX 4070 Ti SUPER).
+  - RNS → limbs uses the same tiling for the column sums (k over the primes) of 64
+    coefficients, one tile of output limbs at a time: after each tile one thread per
+    coefficient adds the sums into the result, carrying from tile to tile in registers,
+    and writes those limbs; it then reduces mod N with the quotient estimated in double
+    precision (one 64-bit multiply-subtract pass and normally one check). Shared memory is
+    one tile of sums whatever the size of N. For 33–48 limbs (1025–1536 bits) a variant that
+    keeps the column sums of all limbs is faster, below 32 limbs one dot product per thread.
+    2.1 ns per coefficient at 1024 bits, 5.8 at 2048, 22 at 4096, 25 at 4608.
+    `bench/bench_conv` measures both directions.
   - Tried and rejected (M6): the same products as int8 tensor-core GEMMs (bytes of limbs ×
     bytes of constants, exact in int32). With the short inner dimension (4 × limbs) a WMMA
     kernel reached only 13–22 T MAC/s, no faster than the CUDA-core kernels.
@@ -107,6 +123,12 @@ For each curve (or batch of curves, see below):
 2. Compute 1/rev(F) by Newton iteration.
 3. For each of the k blocks: roots of G, build G (tree discarded), then H ← G·H mod F (PrerevertDivision).
 4. Transposed polyeval of H over F's tree, product of the values, gcd on the CPU.
+
+The transforms of F's tree levels (the pairs as step 1 multiplied them) are kept for step 4
+as far as the GPU memory left over allows (dF a power of two, nodes of degree 4 and up). On
+those levels the evaluation holds its values reversed per node, so that the middle product
+needed for a child is coefficients m..2m−1 of (sibling) × (reversed values), with the
+sibling's transform as kept: one conversion and one forward transform less per level.
 
 **Curve batching.** For small dF a single curve cannot fill the GPU: kernels have too little
 work (or a partly filled last wave), and launch latency dominates. `Stage2Engine::run_batch`

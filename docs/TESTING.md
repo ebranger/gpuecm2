@@ -119,4 +119,7 @@ Environment variables read by the stage 2 engine (for tests only):
 - `GPUECM2_INJECT_FAULT=1|2`: corrupt one coefficient (of H before the evaluation, or of F),
   to check that `-selfcheck` catches it.
 - `GPUECM2_PARAMS_ONLY=1`: print the stage 2 parameters of each residue, run no stage 2.
+- `GPUECM2_NO_TREE_CACHE=1`: do not keep the transforms of F's product tree for the
+  evaluation (the evaluation then converts and transforms the tree levels again).
+- `GPUECM2_TO_LIMBS=dot|cs|tiled`: force one of the RNS-to-limbs kernels (benchmarks).
 - `GPUECM2_DEBUG=1`: print the root generation plan.
