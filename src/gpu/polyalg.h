@@ -29,6 +29,11 @@ struct ProductTree {
   size_t batch = 1;  // number of trees; tree c uses entries c*n .. c*n+n-1 of every level
   int L = 0;
   std::vector<uint32_t *> level;
+  /* fwd[l] (l >= fwd_min, if fwd_min >= 0): the transforms of the level-l
+     nodes as tree_build multiplied them (pairs, length 2^(l+1), with their
+     leading 1), kept for poly_eval_tree; RNS layout, 2 batch n words per prime */
+  std::vector<uint32_t *> fwd;
+  int fwd_min = -1;
 };
 
 /* All functions below work on `batch` independent problems of the same size
@@ -36,9 +41,12 @@ struct ProductTree {
    c*n .. c*n+n-1 of each array, whose leading dimension is batch*n. */
 
 /* F (n coefficients) := prod (x + roots[i]). With tree != nullptr the levels
-   0..L-1 are kept in *tree (free with tree_free). */
+   0..L-1 are kept in *tree (free with tree_free), and for n a power of two
+   the transforms of as many top levels (down to nodes of degree 4) as fit in
+   cache_bytes, which saves poly_eval_tree a conversion and a transform per
+   level. */
 void tree_build(const RnsContext &ctx, const uint32_t *roots, size_t n, uint32_t *F, ProductTree *tree,
-                cudaStream_t s = 0, size_t batch = 1);
+                cudaStream_t s = 0, size_t batch = 1, size_t cache_bytes = 0);
 void tree_free(ProductTree &tree, cudaStream_t s = 0);
 
 /* I (n coefficients) := 1 / rev(F) mod x^n, where rev(F) = x^n F(1/x)

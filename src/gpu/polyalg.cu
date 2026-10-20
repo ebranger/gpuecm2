@@ -27,10 +27,14 @@ struct Rns {  // a stream-ordered RNS buffer: P x rows x T words
   size_t rows = 0, T = 0;
   int logT = 0;
   cudaStream_t s = 0;
+  bool owned = true;
   Rns(const RnsContext &ctx, size_t rows_, int logT_, cudaStream_t s_) : rows(rows_), T((size_t)1 << logT_), logT(logT_), s(s_) {
     CUDA_CHECK(cudaMallocAsync(&X, (size_t)ctx.P() * rows * T * 4, s));
   }
-  ~Rns() { if (X) cudaFreeAsync(X, s); }
+  /* a buffer that outlives this object (released by its owner) */
+  Rns(uint32_t *ext, size_t rows_, int logT_, cudaStream_t s_)
+      : X(ext), rows(rows_), T((size_t)1 << logT_), logT(logT_), s(s_), owned(false) {}
+  ~Rns() { if (X && owned) cudaFreeAsync(X, s); }
   Rns(const Rns &) = delete;
   Rns &operator=(const Rns &) = delete;
 };
@@ -159,14 +163,23 @@ void exact_product(const RnsContext &ctx, const Operand &a, const Operand &b, si
 /* ------------------------------------------------------------------------- */
 
 void tree_build(const RnsContext &ctx, const uint32_t *roots, size_t n, uint32_t *F, ProductTree *tree,
-                cudaStream_t s, size_t batch) {
+                cudaStream_t s, size_t batch, size_t cache_bytes) {
   const int L = clog2(n);
   const size_t B = batch, N = B * n;  // N: entries (and leading dimension) of every array
+  /* levels fmin .. L-1 keep their transforms (n a power of two, all levels
+     multiplied with NTTs, nodes of degree >= 4) */
+  int fmin = L;
+  if (tree && cache_bytes && (n & (n - 1)) == 0 && L <= ctx.logTmax()) {
+    const size_t per_level = (size_t)ctx.P() * 2 * N * 4;
+    fmin = std::max(2, L - (int)std::min<size_t>(cache_bytes / per_level, (size_t)L));
+  }
   if (tree) {
     tree->n = n;
     tree->batch = B;
     tree->L = L;
     tree->level.assign(L, nullptr);
+    tree->fwd.assign(L, nullptr);
+    tree->fwd_min = fmin < L ? fmin : -1;
   }
   if (N == 0) return;
   if (L == 0) {  // n == 1: F = x + f_0
@@ -204,6 +217,17 @@ void tree_build(const RnsContext &ctx, const uint32_t *roots, size_t n, uint32_t
         CUDA_CHECK(cudaFreeAsync(X, s));
         CUDA_CHECK(cudaFreeAsync(Y, s));
       }
+    } else if (pairs && l >= fmin) {  // the whole level at once, its transforms kept in tree->fwd[l]
+      const int logT = l + 1;
+      const size_t T = (size_t)1 << logT;
+      uint32_t *Xk;
+      CUDA_CHECK(cudaMallocAsync(&Xk, (size_t)ctx.P() * 2 * total * T * 4, s));
+      Rns X(Xk, 2 * total, logT, s);
+      load_fwd(ctx, X, cur, N, pmap, total, 2 * m, m, 2, 0, false, (int)m);
+      Rns Y(ctx, total, logT, s);
+      ntt_inverse_adjacent(ctx, X.X, Y.X, total, logT, true, s);
+      ctx.to_limbs_map(Y.X, total, T, 0, 2 * m, nxt, N, pmap, logT, 1, s);
+      tree->fwd[l] = Xk;
     } else if (pairs) {
       const int logT = std::max(3, l + 1);
       const size_t T = (size_t)1 << logT;
@@ -249,6 +273,10 @@ void tree_build(const RnsContext &ctx, const uint32_t *roots, size_t n, uint32_t
 void tree_free(ProductTree &tree, cudaStream_t s) {
   for (uint32_t *p : tree.level) limb_free(p, s);
   tree.level.clear();
+  for (uint32_t *p : tree.fwd)
+    if (p) CUDA_CHECK(cudaFreeAsync(p, s));
+  tree.fwd.clear();
+  tree.fwd_min = -1;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -414,7 +442,13 @@ void poly_eval_tree(const RnsContext &ctx, const ProductTree &tree, const uint32
     mul_inv(ctx, XH, XQ, XH);
     ctx.to_limbs_map(XH.X, B, XH.T, n - 1, n, top, N, dn, logT, 1, s);
   }
-  limb_copy_rows(ctx, top, N, n, b, N, n, B, n, true, s);
+  /* On the levels with kept transforms (fmin and up) b is held reversed per
+     node, rb = rev(b): the middle products are then those of rb with the
+     children as the tree multiplied them, r_i = (c rb)[2m-1-i], and the
+     child's reversed values are coefficients m .. 2m-1 of c rb, as in the
+     usual form with rev(c) b. Below fmin b is switched back. */
+  const int fmin = tree.fwd_min;
+  limb_copy_rows(ctx, top, N, n, b, N, n, B, n, fmin < 0, s);  // rb = top itself
   limb_free(top, s);
   /* transposed descent: a node with input b (k values) and children c_L (deg l),
      c_R (deg m) passes to the left child the middle product of b and c_R and to
@@ -423,11 +457,24 @@ void poly_eval_tree(const RnsContext &ctx, const ProductTree &tree, const uint32
   for (int l = tree.L - 1; l >= 0; l--) {
     const size_t m = (size_t)1 << l;
     const uint32_t *ch = tree.level[l];
+    if (fmin >= 1 && l == fmin - 1) {  // back to natural order: reverse each node of degree 2m
+      uint32_t *b2 = limb_alloc(ctx, N, s);
+      limb_copy_rows(ctx, b, N, 2 * m, b2, N, 2 * m, N / (2 * m), 2 * m, true, s);
+      limb_free(b, s);
+      b = b2;
+    }
     uint32_t *bn = limb_alloc(ctx, N, s);
     const size_t pc = n / (2 * m), total = B * pc;
     const RowMap pmap = RowMap::grouped(2 * m, pc, n);  // parent j of problem c at c*n + 2mj
     const RowMap kmap = RowMap::grouped(m, 2 * pc, n);  // its children (rows 2j, 2j+1)
-    if (pc && l + 1 > ctx.logTmax()) {
+    if (pc && fmin >= 0 && l >= fmin) {  // the children's transforms are kept: b is reversed
+      const int logT = l + 1;
+      const size_t T = (size_t)1 << logT;
+      Rns XB(ctx, total, logT, s), Z(ctx, 2 * total, logT, s);
+      load_fwd(ctx, XB, b, N, pmap, total, 2 * m, 2 * m, 1, 0, false);
+      ntt_inverse_swap(ctx, XB.X, tree.fwd[l], Z.X, total, logT, s);
+      ctx.to_limbs_map(Z.X, 2 * total, T, m, m, bn, N, kmap, logT, 1, s);
+    } else if (pc && l + 1 > ctx.logTmax()) {
       for (size_t c = 0; c < B; c++) {
         Operand Bop{b + c * n, N, 2 * m, 2 * m, false, 0, -1, 2 * m};
         Operand CR{ch + c * n + m, N, 2 * m, m, true, 1, 0, m + 1}, CL{ch + c * n, N, 2 * m, m, true, 1, 0, m + 1};
