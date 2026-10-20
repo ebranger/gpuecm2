@@ -206,7 +206,7 @@ __device__ __forceinline__ void tile_mac(uint32_t (&lo)[TM][TN], uint32_t (&mid)
 
 /* limbs -> RNS: rows are the primes, k runs over the limbs */
 template <int TM>
-__global__ void __launch_bounds__(GB_THREADS) k_to_rns(const uint32_t *__restrict__ A, size_t ld, RowMap src_map,
+__global__ void __launch_bounds__(GB_THREADS, TM == 4 ? 3 : 4) k_to_rns(const uint32_t *__restrict__ A, size_t ld, RowMap src_map,
                                                        size_t src_len, size_t piece_len, size_t npieces, size_t K,
                                                        uint32_t *__restrict__ X, size_t xrows, size_t T,
                                                        size_t dst_offset, bool reverse, RnsTables t) {
