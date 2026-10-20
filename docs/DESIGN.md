@@ -125,7 +125,7 @@ For each curve (or batch of curves, see below):
 4. Transposed polyeval of H over F's tree, product of the values, gcd on the CPU.
 
 With `-treecache` (`GPUECM2_TREE_CACHE` in the C interface; off by default because of the
-memory: up to (log2 dF − 2)·8·P·dF bytes per curve, 1 GB at 1024 bits and dF = 2^17) the
+memory: (log2 dF − 2)·(8·P − 4·nl)·dF bytes per curve, 0.8 GB at 1024 bits and dF = 2^17) the
 transforms of F's tree levels (the pairs as step 1 multiplied them) are kept for step 4 as
 far as the GPU memory left over allows (dF a power of two, nodes of degree 4 and up). On
 those levels the evaluation holds its values reversed per node, so that the middle product

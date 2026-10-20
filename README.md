@@ -59,9 +59,9 @@ The options mean what they mean for `ecm` (stage 2 only). In addition:
 - `-selfcheck` verifies each curve's stage 2 at random points (product trees, and the final
   values at a few roots of F), at a cost of a few percent. Off by default.
 - `-treecache` keeps the transforms of F's product tree for the final evaluation, which makes
-  stage 2 3–7% faster for numbers of up to 1920 bits, at the cost of GPU memory: per curve,
-  about 0.5 GB at 512 bits and 1.0 GB at 1024 bits for B1 = 11e7, 2.1 GB at 1024 bits for
-  26e7 (`gpuecm2 -h` has a table). It uses at most the memory left free by the rest of stage 2.
+  stage 2 2–6% faster for numbers of up to 1920 bits, at the cost of GPU memory: per curve,
+  0.4 GB at 512 bits and 0.8 GB at 1024 bits for B1 = 11e7, 1.6 GB at 1024 bits for 26e7
+  (`gpuecm2 -h` has a table). It uses at most the memory left free by the rest of stage 2.
   Off by default.
 - Consecutive residues of the same number (as `ecm -save` and `ecm -gpu -save` write them) are
   processed together on the GPU when one curve alone cannot keep it busy (B1 below about 1e7).

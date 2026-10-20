@@ -92,12 +92,13 @@ void usage(FILE *f) {
           "  -selfcheck    verify every curve's stage 2 at random points (a few percent\n"
           "                slower; catches hardware errors and bugs)\n"
           "  -treecache    keep the transforms of F's product tree for the evaluation:\n"
-          "                stage 2 3-7%% faster for numbers of up to 1920 bits, but more\n"
-          "                GPU memory, per curve of a batch (GMP-ECM's default B2):\n"
+          "                stage 2 2-6%% faster for numbers of up to 1920 bits (measured at\n"
+          "                GMP-ECM's default parameters), but more GPU memory, per curve\n"
+          "                of a batch (GMP-ECM's default B2):\n"
           "                  bits    B1=1e6   3e6    11e6    43e6    11e7    26e7\n"
-          "                  512      11 MB  51 MB  110 MB  238 MB  510 MB  1.1 GB\n"
-          "                  1024     21 MB 100 MB  218 MB  469 MB  1.0 GB  2.1 GB\n"
-          "                  1536     31 MB 150 MB  325 MB  700 MB  1.5 GB  3.2 GB\n"
+          "                  512       8 MB  39 MB   84 MB  182 MB  390 MB  832 MB\n"
+          "                  1024     16 MB  76 MB  166 MB  357 MB  765 MB  1.6 GB\n"
+          "                  1536     24 MB 114 MB  247 MB  532 MB  1.1 GB  2.4 GB\n"
           "                at most what is free after the rest of stage 2; no effect\n"
           "                above 1920 bits\n");
 }

@@ -46,7 +46,7 @@ extern "C" {
 
 /* flags of gpuecm2_stage2_run */
 #define GPUECM2_SELFCHECK 1u     /* verify product trees and final values at random points (a few % slower) */
-#define GPUECM2_TREE_CACHE 2u    /* keep the transforms of F's product tree for the evaluation: 3-7% faster for
+#define GPUECM2_TREE_CACHE 2u    /* keep the transforms of F's product tree for the evaluation: 2-6% faster for
                                     moduli up to 1920 bits, more GPU memory (as far as free; see gpuecm2 -h) */
 
 /* Stage 2 parameters as GMP-ECM's stage2() takes them: dF and k, and the
