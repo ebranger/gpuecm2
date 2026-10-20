@@ -41,7 +41,10 @@ __device__ __forceinline__ int elem_index(int qq, int u, int i, int sb) {
   return (t / sb) * G * sb + (t % sb) + sb * i;
 }
 
-template <int R, bool INV>
+/* PL: twiddles stored per level (entry hs - 1 + j is omega_(2 hs)^j for the
+   level of half-size hs), so the lanes of a warp read consecutive entries or
+   the same one; else sw[e] = omega_M^e. */
+template <int R, bool INV, bool PL>
 __device__ __forceinline__ void do_pass(uint32_t v[8], int qq, int sb, int M, const uint32_t *sw,
                                         const uint32_t *swp, uint32_t p) {
   constexpr int G = 1 << R, NG = 8 / G;
@@ -56,12 +59,19 @@ __device__ __forceinline__ void do_pass(uint32_t v[8], int qq, int sb, int M, co
 #pragma unroll
       for (int i = 0; i < G; i++) {
         if (i & (1 << l)) continue;
-        const int ex = (rr + sb * (i & ((1 << l) - 1))) * f;
+        const int j = rr + sb * (i & ((1 << l) - 1));
+        const int ex = PL ? (sb << l) - 1 + j : j * f;
         bfly<INV>(e[i], e[i + (1 << l)], sw[ex], swp[ex], p);
       }
     }
   }
 }
+
+/* Shared-memory position of element idx of a row in kRow: the low five bits
+   are XORed with higher ones, so that the three access patterns of the passes
+   (32 consecutive elements, groups of 8 with stride 8, stride 8 per lane) all
+   hit 32 different banks. A permutation within aligned blocks of 32. */
+__device__ __forceinline__ int swz(int idx) { return idx ^ ((idx >> 5) & 7) ^ (((idx >> 6) & 3) << 3); }
 
 template <int R>
 __device__ __forceinline__ void index_set(int idx[8], int qq, int sb) {
@@ -81,12 +91,12 @@ __device__ __forceinline__ void pass_params(int logM, int k, bool inv, int &r, i
   sb = 1 << (logM - levels_above - r);
 }
 
-template <bool INV>
+template <bool INV, bool PL = false>
 __device__ __forceinline__ void run_pass(uint32_t v[8], int r, int qq, int sb, int M, const uint32_t *sw,
                                          const uint32_t *swp, uint32_t p) {
-  if (r == 3) do_pass<3, INV>(v, qq, sb, M, sw, swp, p);
-  else if (r == 2) do_pass<2, INV>(v, qq, sb, M, sw, swp, p);
-  else do_pass<1, INV>(v, qq, sb, M, sw, swp, p);
+  if (r == 3) do_pass<3, INV, PL>(v, qq, sb, M, sw, swp, p);
+  else if (r == 2) do_pass<2, INV, PL>(v, qq, sb, M, sw, swp, p);
+  else do_pass<1, INV, PL>(v, qq, sb, M, sw, swp, p);
 }
 
 __device__ __forceinline__ void get_index_set(int idx[8], int r, int qq, int sb) {
@@ -138,6 +148,39 @@ __device__ __forceinline__ uint32_t premul_load(const PreMul &pm, int q, size_t 
                   pm.B[(((size_t)q * pm.brows + (r ^ 1)) << logT) + pos], p, pinv);
 }
 
+__device__ __forceinline__ void load8(const uint32_t *x, uint32_t v[8]) {  // x 32-byte aligned
+  const uint4 a = reinterpret_cast<const uint4 *>(x)[0], b = reinterpret_cast<const uint4 *>(x)[1];
+  v[0] = a.x; v[1] = a.y; v[2] = a.z; v[3] = a.w; v[4] = b.x; v[5] = b.y; v[6] = b.z; v[7] = b.w;
+}
+__device__ __forceinline__ void store8(uint32_t *x, const uint32_t v[8]) {
+  reinterpret_cast<uint4 *>(x)[0] = make_uint4(v[0], v[1], v[2], v[3]);
+  reinterpret_cast<uint4 *>(x)[1] = make_uint4(v[4], v[5], v[6], v[7]);
+}
+
+/* premul_load for the 8 contiguous positions i .. i+7 (i a multiple of 8) */
+__device__ __forceinline__ void premul_load8(const PreMul &pm, int q, size_t row, int logM, int i, uint32_t v[8],
+                                             uint32_t p, uint32_t pinv, uint32_t ri) {
+  const size_t r = row >> pm.logR, pos = ((row & (((size_t)1 << pm.logR) - 1)) << logM) + i;
+  const int logT = logM + pm.logR;
+  uint32_t a[8], b[8];
+  if (pm.mode == 1) {
+    load8(pm.A + (((size_t)q * pm.arows + r) << logT) + pos, a);
+    load8(pm.B + (((size_t)q * pm.brows + r) << logT) + pos, b);
+  } else if (pm.mode == 2) {
+    const uint32_t *x = pm.A + (((size_t)q * pm.arows + 2 * r) << logT) + pos;
+    load8(x, a);
+    load8(x + ((size_t)1 << logT), b);
+  } else {
+    load8(pm.A + (((size_t)q * pm.arows + r / 2) << logT) + pos, a);
+    load8(pm.B + (((size_t)q * pm.brows + (r ^ 1)) << logT) + pos, b);
+  }
+#pragma unroll
+  for (int k = 0; k < 8; k++) {
+    const uint32_t m = mul_mont(a[k], b[k], p, pinv);
+    v[k] = pm.mode == 2 ? sub_mod(m, ri, p) : m;
+  }
+}
+
 /* M-point transforms of contiguous rows: X[(q*nrows + row)*M + i]; for an
    inverse transform with pm.mode != 0 the input comes from pm instead of X. */
 template <bool INV>
@@ -145,30 +188,40 @@ __global__ void __launch_bounds__(NTT_THREADS) kRow(uint32_t *__restrict__ X, si
                                                     PreMul pm, Pad pd) {
   extern __shared__ uint32_t sm[];
   const int M = 1 << logM, tpr = M / 8, rows_per_block = TILE / M;
-  uint32_t *sw = sm, *swp = sm + M / 2, *sh = sm + M;
+  uint32_t *sw = sm, *swp = sm + M, *sh = sm + 2 * M;
   const int q = blockIdx.y;
   const uint32_t p = t.p[q];
   const uint32_t *wt = INV ? t.iw : t.w, *wtp = INV ? t.iwp : t.wp;
-  const int stride = 4096 / M;
-  for (int i = threadIdx.x; i < M / 2; i += NTT_THREADS) {
-    sw[i] = wt[(size_t)q * 2048 + i * stride];
-    swp[i] = wtp[(size_t)q * 2048 + i * stride];
+  for (int e = threadIdx.x; e < M - 1; e += NTT_THREADS) {  // per-level twiddles (see do_pass)
+    const int hs = 1 << (31 - __clz(e + 1)), j = e - (hs - 1);
+    sw[e] = wt[(size_t)q * 2048 + j * (2048 / hs)];
+    swp[e] = wtp[(size_t)q * 2048 + j * (2048 / hs)];
   }
   const int lrow = threadIdx.x / tpr, qq = threadIdx.x % tpr;
   const size_t row = (size_t)blockIdx.x * rows_per_block + lrow;
   const bool active = row < nrows;
   uint32_t *g = X + ((size_t)q * nrows + row) * M;
-  uint32_t *s = sh + lrow * (M + M / 8);
+  uint32_t *s = sh + lrow * M;
   const int npass = (logM + 2) / 3;
   uint32_t v[8];
   int idx[8], r, sb;
   pass_params(logM, 0, INV, r, sb);
   get_index_set(idx, r, qq, sb);
+  /* sb == 1 with r == 3 (the first pass of an inverse transform, the last of a
+     forward one): the thread's 8 elements are contiguous, idx[i] = 8 qq + i,
+     and are loaded / stored as two 16-byte vectors (whole 32-byte sectors) */
+  const bool vec = sb == 1 && r == 3;
   if (active) {
     if (INV && pm.mode) {
       const uint32_t pinv = t.pinv[q], ri = pm.sub_one ? t.rinv[q] : 0;
+      if (vec) {
+        premul_load8(pm, q, row, logM, idx[0], v, p, pinv, ri);
+      } else {
 #pragma unroll
-      for (int i = 0; i < 8; i++) v[i] = premul_load(pm, q, row, logM, idx[i], p, pinv, ri);
+        for (int i = 0; i < 8; i++) v[i] = premul_load(pm, q, row, logM, idx[i], p, pinv, ri);
+      }
+    } else if (vec && (INV || pd.len == SIZE_MAX)) {
+      load8(g + idx[0], v);
     } else if (!INV && pd.len != SIZE_MAX) {
 #pragma unroll
       for (int i = 0; i < 8; i++) v[i] = pad_load(pd, g + idx[i], (size_t)idx[i], p);
@@ -179,20 +232,25 @@ __global__ void __launch_bounds__(NTT_THREADS) kRow(uint32_t *__restrict__ X, si
   }
   __syncthreads();
   for (int k = 0; k < npass; k++) {
-    if (active) run_pass<INV>(v, r, qq, sb, M, sw, swp, p);
+    if (active) run_pass<INV, true>(v, r, qq, sb, M, sw, swp, p);
     if (k == npass - 1) break;
 #pragma unroll
-    for (int i = 0; i < 8; i++) s[idx[i] + (idx[i] >> 3)] = v[i];
+    for (int i = 0; i < 8; i++) s[swz(idx[i])] = v[i];
     __syncthreads();
     pass_params(logM, k + 1, INV, r, sb);
     get_index_set(idx, r, qq, sb);
 #pragma unroll
-    for (int i = 0; i < 8; i++) v[i] = s[idx[i] + (idx[i] >> 3)];
+    for (int i = 0; i < 8; i++) v[i] = s[swz(idx[i])];
     __syncthreads();
   }
-  if (active)
+  if (active) {
+    if (sb == 1 && r == 3) {
+      store8(g + idx[0], v);
+    } else {
 #pragma unroll
-    for (int i = 0; i < 8; i++) g[idx[i]] = v[i];
+      for (int i = 0; i < 8; i++) g[idx[i]] = v[i];
+    }
+  }
 }
 
 /* R-point transforms down the columns of each T = R*C polynomial, with the
@@ -296,7 +354,7 @@ __global__ void k_pointwise_pairs(const uint32_t *__restrict__ B, const uint32_t
   }
 }
 
-size_t row_smem(int logM) { return ((size_t)(1 << logM) + TILE + TILE / 8) * 4; }
+size_t row_smem(int logM) { return ((size_t)2 * (1 << logM) + TILE) * 4; }
 size_t col_smem(int logR) { return ((size_t)(1 << logR) + TILE + TILE / 8) * 4; }
 
 template <bool INV>
