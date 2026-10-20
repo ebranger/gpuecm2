@@ -31,7 +31,8 @@ struct ProductTree {
   std::vector<uint32_t *> level;
   /* fwd[l] (l >= fwd_min, if fwd_min >= 0): the transforms of the level-l
      nodes as tree_build multiplied them (pairs, length 2^(l+1), with their
-     leading 1), kept for poly_eval_tree; RNS layout, 2 batch n words per prime */
+     leading 1), kept for poly_eval_tree; RNS layout, 2 batch n words per prime.
+     level[l] is then freed (nullptr): the evaluation does not need it. */
   std::vector<uint32_t *> fwd;
   int fwd_min = -1;
 };

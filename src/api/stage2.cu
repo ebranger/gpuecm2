@@ -232,10 +232,10 @@ std::vector<Stage2Outcome> Stage2Engine::run_batch(const MontgomeryCurve *Cs, si
   after(sp, sr, ev_[0]);
   uint32_t *F = limb_alloc(ctx, N, sp), *I = limb_alloc(ctx, N, sp);
   ProductTree tree;
-  /* the transforms of F's tree are kept for the evaluation as far as the GPU
-     memory left over by this run allows (80% of it) */
+  /* with set_tree_cache, the transforms of F's tree are kept for the
+     evaluation as far as the GPU memory left over by this run allows (80% of it) */
   size_t keep = 0;
-  if (!getenv("GPUECM2_NO_TREE_CACHE")) {  // testing aid
+  if (tree_cache_) {
     const size_t budget = stage2_gpu_budget(), need = stage2_gpu_bytes(n_.get(), sp_, B);
     if (budget > need) keep = (budget - need) / 10 * 8;
   }

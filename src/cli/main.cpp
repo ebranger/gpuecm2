@@ -30,6 +30,7 @@ int verbose = 1;  // 0 quiet, 1 normal, 2 verbose (-v), ...
 bool print_curve = false;  // testing aid: print the Montgomery A computed from sigma
 bool one = false;          // -one: stop with a number once a factor is found
 bool selfcheck = false;    // -selfcheck: verify the stage 2 arithmetic of every curve
+bool tree_cache = false;   // -treecache: keep the transforms of F's product tree
 long batch_opt = 0;        // -batch n: curves per GPU run (0: automatic)
 bool spin = false;         // -spin: busy-wait for the GPU
 
@@ -89,7 +90,16 @@ void usage(FILE *f) {
           "  -spin         busy-wait for the GPU (uses a full CPU core; by default the\n"
           "                CPU sleeps while the GPU works)\n"
           "  -selfcheck    verify every curve's stage 2 at random points (a few percent\n"
-          "                slower; catches hardware errors and bugs)\n");
+          "                slower; catches hardware errors and bugs)\n"
+          "  -treecache    keep the transforms of F's product tree for the evaluation:\n"
+          "                stage 2 3-7%% faster for numbers of up to 1920 bits, but more\n"
+          "                GPU memory, per curve of a batch (GMP-ECM's default B2):\n"
+          "                  bits    B1=1e6   3e6    11e6    43e6    11e7    26e7\n"
+          "                  512      11 MB  51 MB  110 MB  238 MB  510 MB  1.1 GB\n"
+          "                  1024     21 MB 100 MB  218 MB  469 MB  1.0 GB  2.1 GB\n"
+          "                  1536     31 MB 150 MB  325 MB  700 MB  1.5 GB  3.2 GB\n"
+          "                at most what is free after the rest of stage 2; no effect\n"
+          "                above 1920 bits\n");
 }
 
 /* B2 bounds: integer, or floating point like 7.7e11 (finite, not negative) */
@@ -374,6 +384,7 @@ int main(int argc, char **argv) {
     else if (a == "-printcurve") print_curve = true;
     else if (a == "-one") one = true;
     else if (a == "-selfcheck") selfcheck = true;
+    else if (a == "-treecache") tree_cache = true;
     else if (a == "-batch") {
       if (!parse_long(need("-batch"), 0, 1000000L, &lv)) bad("-batch", "a number of residues, 0 for automatic");
       batch_opt = lv;
@@ -483,6 +494,7 @@ int main(int argc, char **argv) {
     if (!engine || mpz_cmp(engine_n.get(), J0.rec.n.get()) != 0 || !same_params(engine_sp, J0.sp)) {
       engine.reset();
       engine.reset(new Stage2Engine(J0.rec.n.get(), J0.sp));
+      engine->set_tree_cache(tree_cache);
       if (!engine->ok()) {
         fprintf(stderr, "Error: %s\n", engine->error().c_str());
         engine.reset();

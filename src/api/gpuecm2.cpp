@@ -169,6 +169,7 @@ int gpuecm2_stage2_run(gpuecm2_stage2 *s, size_t count, mpz_t *A, mpz_t *x, int 
     idx.push_back(i);
   }
   const size_t B = gpuecm2_stage2_batch_size(s);
+  s->engine->set_tree_cache((flags & GPUECM2_TREE_CACHE) != 0);
   for (size_t at = 0; at < curves.size(); at += B) {
     const size_t cnt = std::min(B, curves.size() - at);
     std::vector<Stage2Outcome> out =

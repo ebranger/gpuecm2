@@ -7,6 +7,7 @@
 #include "gpu/polyalg.h"
 
 #include <algorithm>
+#include <cstdlib>
 
 #include "gpu/arith32.cuh"
 #include "gpu/cuda_check.h"
@@ -171,7 +172,10 @@ void tree_build(const RnsContext &ctx, const uint32_t *roots, size_t n, uint32_t
   int fmin = L;
   if (tree && cache_bytes && (n & (n - 1)) == 0 && L <= ctx.logTmax()) {
     const size_t per_level = (size_t)ctx.P() * 2 * N * 4;
-    fmin = std::max(2, L - (int)std::min<size_t>(cache_bytes / per_level, (size_t)L));
+    size_t fit = std::min<size_t>(cache_bytes / per_level, (size_t)L);
+    if (const char *e = getenv("GPUECM2_TREE_CACHE_LEVELS"))  // testing aid: at most this many levels
+      fit = std::min<size_t>(fit, (size_t)atol(e));
+    fmin = std::max(2, L - (int)fit);
   }
   if (tree) {
     tree->n = n;
@@ -228,6 +232,10 @@ void tree_build(const RnsContext &ctx, const uint32_t *roots, size_t n, uint32_t
       ntt_inverse_adjacent(ctx, X.X, Y.X, total, logT, true, s);
       ctx.to_limbs_map(Y.X, total, T, 0, 2 * m, nxt, N, pmap, logT, 1, s);
       tree->fwd[l] = Xk;
+      /* the evaluation uses the transforms of this level, not its coefficients */
+      limb_free(cur, s);
+      tree->level[l] = nullptr;
+      cur = nullptr;
     } else if (pairs) {
       const int logT = std::max(3, l + 1);
       const size_t T = (size_t)1 << logT;
@@ -265,13 +273,14 @@ void tree_build(const RnsContext &ctx, const uint32_t *roots, size_t n, uint32_t
         limb_copy_rows(ctx, cur + base, N, n, nxt + base, N, n, B, k, false, s);
       }
     }
-    if (!tree) limb_free(cur, s);
+    if (!tree && cur) limb_free(cur, s);
     cur = nxt;
   }
 }
 
 void tree_free(ProductTree &tree, cudaStream_t s) {
-  for (uint32_t *p : tree.level) limb_free(p, s);
+  for (uint32_t *p : tree.level)
+    if (p) limb_free(p, s);
   tree.level.clear();
   for (uint32_t *p : tree.fwd)
     if (p) CUDA_CHECK(cudaFreeAsync(p, s));

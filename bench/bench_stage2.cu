@@ -1,7 +1,7 @@
 /* Benchmark of a complete stage 2 (random curve and point) with GMP-ECM's
    parameters. N is an RSA challenge number (tests/data/rsa_numbers.txt), a
    product of them ("RSA-2048*RSA-1024"), or a bit size (random RSA-like N).
-   Usage: bench_stage2 <N> <B1> [B2] [-power n | -dickson n] [-k n] [-maxmem MB] [-reps r] [-untimed 1]
+   Usage: bench_stage2 <N> <B1> [B2] [-power n | -dickson n] [-k n] [-maxmem MB] [-reps r] [-untimed 1] [-treecache 1]
                        [-batch b] [-spin 1]
    (-untimed: no synchronisation between phases; only the total is meaningful;
    -batch: b curves per run, times per curve; 0: automatic batch size) */
@@ -72,7 +72,7 @@ int main(int argc, char **argv) {
   req.B1 = atof(argv[2]);
   int reps = 3, argi = 3;
   long batch = 1;
-  bool spin = false;
+  bool spin = false, treecache = false;
   bool timed = true;
   if (argc > 3 && argv[3][0] != '-') { mpz_set_d(req.B2.get(), atof(argv[3])); argi = 4; }
   for (; argi + 1 < argc; argi += 2) {
@@ -84,6 +84,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[argi], "-batch")) batch = atol(argv[argi + 1]);
     else if (!strcmp(argv[argi], "-maxmem")) req.maxmem = atof(argv[argi + 1]) * 1048576.;
     else if (!strcmp(argv[argi], "-spin")) spin = atoi(argv[argi + 1]) != 0;
+    else if (!strcmp(argv[argi], "-treecache")) treecache = atoi(argv[argi + 1]) != 0;
     else { fprintf(stderr, "unknown option %s\n", argv[argi]); return 1; }
   }
   stage2_cpu_wait(spin);
@@ -98,6 +99,7 @@ int main(int argc, char **argv) {
              req.B1, sp.B2.get(), sp.dF, sp.k, sp.S, stage2_gpu_bytes(E.n.get(), sp) / 1048576.);
   if (batch <= 0) batch = (long)stage2_auto_batch(E.n.get(), sp, stage2_gpu_budget());
   Stage2Engine eng(E.n.get(), sp);
+  eng.set_tree_cache(treecache);
   if (!eng.ok()) { printf("%s\n", eng.error().c_str()); return 1; }
   Stage2Times best;
   best.total = 1e30;
@@ -120,5 +122,12 @@ int main(int argc, char **argv) {
          t.rootsF * per, t.treeF * per, t.invF * per, t.rootsG * per, t.treesG * per, t.mulmod * per, t.eval * per,
          t.prod * per);
   printf("  total %.2f ms (best of %d)\n", t.total * per, reps);
+  if (getenv("BENCH_MEM")) {  // peak of the stream-ordered pool (all allocations of stage 2 go there)
+    cudaMemPool_t pool;
+    uint64_t used_hi = 0;
+    if (cudaDeviceGetDefaultMemPool(&pool, 0) == cudaSuccess &&
+        cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemHigh, &used_hi) == cudaSuccess)
+      printf("  GPU memory pool peak %.0f MB (%ld curves)\n", used_hi / 1048576., batch);
+  }
   return 0;
 }

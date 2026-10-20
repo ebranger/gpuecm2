@@ -85,7 +85,15 @@ class Stage2Engine {
      which curve it belongs to (rare). The times are those of the batch. */
   std::vector<Stage2Outcome> run_batch(const MontgomeryCurve *C, size_t count, bool timed, bool selfcheck = false);
 
+  /* Keep the transforms of F's product tree for the evaluation (dF a power
+     of two, i.e. moduli up to 1920 bits with GMP-ECM's parameters): 3-7%
+     faster, for up to (log2 dF - 2) * 8 P dF bytes more GPU memory per curve,
+     as far as the memory left over by the rest of the run allows. Off by
+     default. */
+  void set_tree_cache(bool on) { tree_cache_ = on; }
+
  private:
+  bool tree_cache_ = false;
   Z n_;
   Stage2Params sp_;
   RnsContext ctx_;
