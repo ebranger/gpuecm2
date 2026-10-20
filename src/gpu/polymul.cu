@@ -70,8 +70,7 @@ void poly_mul(const RnsContext &ctx, const uint32_t *A, size_t lda, size_t la, c
     ctx.from_limbs(B, ldb, rows, lb, XB, T, s);
     ntt_forward(ctx, XA, rows, logT, s);
     ntt_forward(ctx, XB, rows, logT, s);
-    ntt_pointwise_mul(ctx, XA, XB, XA, rows * T, s);
-    ntt_inverse(ctx, XA, rows, logT, s);
+    ntt_inverse_mul(ctx, XA, XB, XA, rows, logT, s);
     ctx.to_limbs(XA, rows, T, 0, lc, C, ldc, logT, 1, s);
     CUDA_CHECK(cudaFreeAsync(XA, s));
     CUDA_CHECK(cudaFreeAsync(XB, s));

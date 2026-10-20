@@ -39,16 +39,14 @@ struct Rns {  // a stream-ordered RNS buffer: P x rows x T words
    optionally reversed and shifted (see RnsContext::from_limbs_ex), transformed. */
 void load_fwd(const RnsContext &ctx, Rns &R, const uint32_t *A, size_t ld, const RowMap &map, size_t rows,
               size_t src_len, size_t piece_len, size_t npieces, size_t offset, bool reverse, int lead_pos = -1) {
-  ctx.from_limbs_map(A, ld, map, rows, src_len, piece_len, npieces, R.X, R.T, offset, reverse, R.s);
-  if (lead_pos >= 0) ctx.add_const(R.X, rows * npieces, R.T, (size_t)lead_pos, 1, R.s);
+  ctx.from_limbs_map(A, ld, map, rows, src_len, piece_len, npieces, R.X, R.T, offset, reverse, R.s, lead_pos);
   ntt_forward(ctx, R.X, rows * npieces, R.logT, R.s);
 }
 
 /* single-row cyclic product Z = X * Y (both transformed, length T), returned
    untransformed in Z (may alias X) */
 void mul_inv(const RnsContext &ctx, const Rns &X, const Rns &Y, Rns &Z) {
-  ntt_pointwise_mul(ctx, X.X, Y.X, Z.X, X.rows * X.T, Z.s);
-  ntt_inverse(ctx, Z.X, Z.rows, Z.logT, Z.s);
+  ntt_inverse_mul(ctx, X.X, Y.X, Z.X, Z.rows, Z.logT, Z.s);
 }
 
 /* Transient GPU memory allowed per batched step; larger batches are chunked. */
@@ -210,8 +208,7 @@ void tree_build(const RnsContext &ctx, const uint32_t *roots, size_t n, uint32_t
         Rns X(ctx, 2 * pr, logT, s);
         load_fwd(ctx, X, cur, N, pmap.from(p0), pr, 2 * m, m, 2, 0, false, (int)m);
         Rns Y(ctx, pr, logT, s);
-        ntt_pointwise_adjacent(ctx, X.X, Y.X, pr, T, T == 2 * m, s);
-        ntt_inverse(ctx, Y.X, pr, logT, s);
+        ntt_inverse_adjacent(ctx, X.X, Y.X, pr, logT, T == 2 * m, s);
         ctx.to_limbs_map(Y.X, pr, T, 0, 2 * m, nxt, N, pmap.from(p0), logT, 1, s);
       }
     }
@@ -368,8 +365,7 @@ void MulModF::mulmod(const uint32_t *G, uint32_t *H, cudaStream_t s) {
   {
     Rns XQ(ctx, B, logT2_, s);
     load_fwd(ctx, XQ, A + n, ldA, da, B, lq, lq, 1, 0, true);
-    ntt_pointwise_mul(ctx, XQ.X, I_hat_, XQ.X, B * XQ.T, s);
-    ntt_inverse(ctx, XQ.X, B, logT2_, s);
+    ntt_inverse_mul(ctx, XQ.X, I_hat_, XQ.X, B, logT2_, s);
     ctx.to_limbs_map(XQ.X, B, XQ.T, 0, lq, Qr, ldQ, RowMap::dense(lq), logT2_, 1, s);
   }
   /* C = q * (F + x^n), cyclic of length n (wrap) or full; H = a_low - (qF)_low */
@@ -377,8 +373,7 @@ void MulModF::mulmod(const uint32_t *G, uint32_t *H, cudaStream_t s) {
   {
     Rns XC(ctx, B, logTq_, s);
     load_fwd(ctx, XC, Qr, ldQ, RowMap::dense(lq), B, lq, lq, 1, 0, true);  // q = rev(Qr)
-    ntt_pointwise_mul(ctx, XC.X, F_hat_, XC.X, B * XC.T, s);
-    ntt_inverse(ctx, XC.X, B, logTq_, s);
+    ntt_inverse_mul(ctx, XC.X, F_hat_, XC.X, B, logTq_, s);
     ctx.to_limbs_map(XC.X, B, XC.T, 0, n, C, ld, dn, logTq_, 1, s);
   }
   limb_sub_rows(ctx, A, ldA, la, C, ld, n, H, ld, n, B, n, s);
@@ -460,8 +455,7 @@ void poly_eval_tree(const RnsContext &ctx, const ProductTree &tree, const uint32
         Rns XB(ctx, pr, logT, s), XC(ctx, 2 * pr, logT, s), Z(ctx, 2 * pr, logT, s);
         load_fwd(ctx, XB, b, N, pmap.from(p0), pr, 2 * m, 2 * m, 1, 0, false);
         load_fwd(ctx, XC, ch, N, pmap.from(p0), pr, 2 * m, m, 2, 1, true, 0);
-        ntt_pointwise_swap(ctx, XB.X, XC.X, Z.X, pr, T, s);
-        ntt_inverse(ctx, Z.X, 2 * pr, logT, s);
+        ntt_inverse_swap(ctx, XB.X, XC.X, Z.X, pr, logT, s);
         ctx.to_limbs_map(Z.X, 2 * pr, T, m, m, bn, N, kmap.from(2 * p0), logT, 1, s);
       }
     }

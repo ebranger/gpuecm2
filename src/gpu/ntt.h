@@ -20,6 +20,18 @@
 void ntt_forward(const RnsContext &ctx, uint32_t *X, size_t rows, int logT, cudaStream_t s = 0);
 void ntt_inverse(const RnsContext &ctx, uint32_t *X, size_t rows, int logT, cudaStream_t s = 0);
 
+/* The pointwise products below followed by ntt_inverse, in one pass less:
+   the first pass of the inverse transform forms the products as it loads.
+   Z := inverse(X .* Y), rows of length 2^logT; Z may alias X or Y. */
+void ntt_inverse_mul(const RnsContext &ctx, const uint32_t *X, const uint32_t *Y, uint32_t *Z, size_t rows, int logT,
+                     cudaStream_t s = 0);
+/* Y[j] := inverse(X[2j] .* X[2j+1] (- 1 with sub_one)), j < count; Y must not alias X. */
+void ntt_inverse_adjacent(const RnsContext &ctx, const uint32_t *X, uint32_t *Y, size_t count, int logT, bool sub_one,
+                          cudaStream_t s = 0);
+/* Z[2j] := inverse(B[j] .* C[2j+1]), Z[2j+1] := inverse(B[j] .* C[2j]); Z must not alias B or C. */
+void ntt_inverse_swap(const RnsContext &ctx, const uint32_t *B, const uint32_t *C, uint32_t *Z, size_t count, int logT,
+                      cudaStream_t s = 0);
+
 /* Z := X .* Y * 2^-32 (Montgomery) per prime; Z may alias X or Y. n = rows*T. */
 void ntt_pointwise_mul(const RnsContext &ctx, const uint32_t *X, const uint32_t *Y, uint32_t *Z, size_t rows_T,
                        cudaStream_t s = 0);

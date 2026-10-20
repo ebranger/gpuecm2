@@ -95,9 +95,39 @@ __device__ __forceinline__ void get_index_set(int idx[8], int r, int qq, int sb)
   else index_set<1>(idx, qq, sb);
 }
 
-/* M-point transforms of contiguous rows: X[(q*nrows + row)*M + i]. */
+/* Where the first pass of an inverse transform gets its input: X itself
+   (mode 0) or a pointwise product (Montgomery) of transformed rows of length
+   T = R*M (R sub-rows of M per row): 1: A[r] .* B[r];  2: A[2r] .* A[2r+1]
+   (- 1 with sub_one);  3: A[r/2] .* B[r^1] (B has twice the rows of A). */
+struct PreMul {
+  int mode = 0;
+  const uint32_t *A = nullptr, *B = nullptr;
+  size_t arows = 0, brows = 0;  // rows (of length T) per prime in A and B
+  int logR = 0;                 // sub-rows of M per row of T
+  bool sub_one = false;
+};
+
+__device__ __forceinline__ uint32_t premul_load(const PreMul &pm, int q, size_t row, int logM, int i, uint32_t p,
+                                                uint32_t pinv, uint32_t ri) {
+  const size_t r = row >> pm.logR, pos = ((row & (((size_t)1 << pm.logR) - 1)) << logM) + i;
+  const int logT = logM + pm.logR;
+  if (pm.mode == 1) {
+    const size_t o = (((size_t)q * pm.arows + r) << logT) + pos;
+    return mul_mont(pm.A[o], pm.B[(((size_t)q * pm.brows + r) << logT) + pos], p, pinv);
+  }
+  if (pm.mode == 2) {
+    const uint32_t *x = pm.A + (((size_t)q * pm.arows + 2 * r) << logT) + pos;
+    return sub_mod(mul_mont(x[0], x[(size_t)1 << logT], p, pinv), ri, p);
+  }
+  return mul_mont(pm.A[(((size_t)q * pm.arows + r / 2) << logT) + pos],
+                  pm.B[(((size_t)q * pm.brows + (r ^ 1)) << logT) + pos], p, pinv);
+}
+
+/* M-point transforms of contiguous rows: X[(q*nrows + row)*M + i]; for an
+   inverse transform with pm.mode != 0 the input comes from pm instead of X. */
 template <bool INV>
-__global__ void __launch_bounds__(NTT_THREADS) kRow(uint32_t *__restrict__ X, size_t nrows, int logM, RnsTables t) {
+__global__ void __launch_bounds__(NTT_THREADS) kRow(uint32_t *__restrict__ X, size_t nrows, int logM, RnsTables t,
+                                                    PreMul pm) {
   extern __shared__ uint32_t sm[];
   const int M = 1 << logM, tpr = M / 8, rows_per_block = TILE / M;
   uint32_t *sw = sm, *swp = sm + M / 2, *sh = sm + M;
@@ -119,9 +149,16 @@ __global__ void __launch_bounds__(NTT_THREADS) kRow(uint32_t *__restrict__ X, si
   int idx[8], r, sb;
   pass_params(logM, 0, INV, r, sb);
   get_index_set(idx, r, qq, sb);
-  if (active)
+  if (active) {
+    if (INV && pm.mode) {
+      const uint32_t pinv = t.pinv[q], ri = pm.sub_one ? t.rinv[q] : 0;
 #pragma unroll
-    for (int i = 0; i < 8; i++) v[i] = g[idx[i]];
+      for (int i = 0; i < 8; i++) v[i] = premul_load(pm, q, row, logM, idx[i], p, pinv, ri);
+    } else {
+#pragma unroll
+      for (int i = 0; i < 8; i++) v[i] = g[idx[i]];
+    }
+  }
   __syncthreads();
   for (int k = 0; k < npass; k++) {
     if (active) run_pass<INV>(v, r, qq, sb, M, sw, swp, p);
@@ -240,10 +277,10 @@ size_t row_smem(int logM) { return ((size_t)(1 << logM) + TILE + TILE / 8) * 4; 
 size_t col_smem(int logR) { return ((size_t)(1 << logR) + TILE + TILE / 8) * 4; }
 
 template <bool INV>
-void launch_row(const RnsContext &ctx, uint32_t *X, size_t nrows, int logM, cudaStream_t s) {
+void launch_row(const RnsContext &ctx, uint32_t *X, size_t nrows, int logM, cudaStream_t s, PreMul pm = PreMul()) {
   const size_t M = (size_t)1 << logM, rows_per_block = TILE / M;
   dim3 grid((unsigned)((nrows + rows_per_block - 1) / rows_per_block), (unsigned)ctx.P());
-  kRow<INV><<<grid, NTT_THREADS, row_smem(logM), s>>>(X, nrows, logM, ctx.tables());
+  kRow<INV><<<grid, NTT_THREADS, row_smem(logM), s>>>(X, nrows, logM, ctx.tables(), pm);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -277,15 +314,48 @@ void ntt_forward(const RnsContext &ctx, uint32_t *X, size_t rows, int logT, cuda
   }
 }
 
-void ntt_inverse(const RnsContext &ctx, uint32_t *X, size_t rows, int logT, cudaStream_t s) {
+namespace {
+/* inverse transform of `rows` rows of X whose input is given by pm */
+void inverse_from(const RnsContext &ctx, uint32_t *X, size_t rows, int logT, PreMul pm, cudaStream_t s) {
   check_len(ctx, logT);
   if (logT <= 12) {
-    launch_row<true>(ctx, X, rows, logT, s);
+    pm.logR = 0;
+    launch_row<true>(ctx, X, rows, logT, s, pm);
   } else {
     const int logR = split_logR(logT);
-    launch_row<true>(ctx, X, rows << logR, logT - logR, s);
+    pm.logR = logR;
+    launch_row<true>(ctx, X, rows << logR, logT - logR, s, pm);
     launch_col<true>(ctx, X, rows, logT, logR, s);
   }
+}
+}  // namespace
+
+void ntt_inverse(const RnsContext &ctx, uint32_t *X, size_t rows, int logT, cudaStream_t s) {
+  inverse_from(ctx, X, rows, logT, PreMul(), s);
+}
+
+void ntt_inverse_mul(const RnsContext &ctx, const uint32_t *X, const uint32_t *Y, uint32_t *Z, size_t rows, int logT,
+                     cudaStream_t s) {
+  if (!rows) return;
+  PreMul pm;
+  pm.mode = 1; pm.A = X; pm.B = Y; pm.arows = pm.brows = rows;
+  inverse_from(ctx, Z, rows, logT, pm, s);
+}
+
+void ntt_inverse_adjacent(const RnsContext &ctx, const uint32_t *X, uint32_t *Y, size_t count, int logT, bool sub_one,
+                          cudaStream_t s) {
+  if (!count) return;
+  PreMul pm;
+  pm.mode = 2; pm.A = X; pm.arows = 2 * count; pm.sub_one = sub_one;
+  inverse_from(ctx, Y, count, logT, pm, s);
+}
+
+void ntt_inverse_swap(const RnsContext &ctx, const uint32_t *B, const uint32_t *C, uint32_t *Z, size_t count, int logT,
+                      cudaStream_t s) {
+  if (!count) return;
+  PreMul pm;
+  pm.mode = 3; pm.A = B; pm.B = C; pm.arows = count; pm.brows = 2 * count;
+  inverse_from(ctx, Z, 2 * count, logT, pm, s);
 }
 
 void ntt_pointwise_mul(const RnsContext &ctx, const uint32_t *X, const uint32_t *Y, uint32_t *Z, size_t rows_T,
