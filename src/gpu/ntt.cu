@@ -107,6 +107,21 @@ struct PreMul {
   bool sub_one = false;
 };
 
+/* The input of the first pass of a forward transform: positions outside
+   [lo, lo + len) of each row are 0, except lead which is lead_c; they are
+   not read. len == SIZE_MAX: all positions are read. */
+struct Pad {
+  size_t lo = 0, len = SIZE_MAX;
+  long lead = -1;
+  int lead_c = 0;
+};
+
+__device__ __forceinline__ uint32_t pad_load(const Pad &pd, const uint32_t *x, size_t pos, uint32_t p) {
+  if (pos - pd.lo < pd.len) return *x;  // unsigned: pos >= lo && pos < lo + len
+  if ((long)pos != pd.lead) return 0;
+  return pd.lead_c >= 0 ? (uint32_t)pd.lead_c % p : p - (uint32_t)(-pd.lead_c) % p;
+}
+
 __device__ __forceinline__ uint32_t premul_load(const PreMul &pm, int q, size_t row, int logM, int i, uint32_t p,
                                                 uint32_t pinv, uint32_t ri) {
   const size_t r = row >> pm.logR, pos = ((row & (((size_t)1 << pm.logR) - 1)) << logM) + i;
@@ -127,7 +142,7 @@ __device__ __forceinline__ uint32_t premul_load(const PreMul &pm, int q, size_t 
    inverse transform with pm.mode != 0 the input comes from pm instead of X. */
 template <bool INV>
 __global__ void __launch_bounds__(NTT_THREADS) kRow(uint32_t *__restrict__ X, size_t nrows, int logM, RnsTables t,
-                                                    PreMul pm) {
+                                                    PreMul pm, Pad pd) {
   extern __shared__ uint32_t sm[];
   const int M = 1 << logM, tpr = M / 8, rows_per_block = TILE / M;
   uint32_t *sw = sm, *swp = sm + M / 2, *sh = sm + M;
@@ -154,6 +169,9 @@ __global__ void __launch_bounds__(NTT_THREADS) kRow(uint32_t *__restrict__ X, si
       const uint32_t pinv = t.pinv[q], ri = pm.sub_one ? t.rinv[q] : 0;
 #pragma unroll
       for (int i = 0; i < 8; i++) v[i] = premul_load(pm, q, row, logM, idx[i], p, pinv, ri);
+    } else if (!INV && pd.len != SIZE_MAX) {
+#pragma unroll
+      for (int i = 0; i < 8; i++) v[i] = pad_load(pd, g + idx[i], (size_t)idx[i], p);
     } else {
 #pragma unroll
       for (int i = 0; i < 8; i++) v[i] = g[idx[i]];
@@ -182,7 +200,7 @@ __global__ void __launch_bounds__(NTT_THREADS) kRow(uint32_t *__restrict__ X, si
    COLS = 4096/R columns per block, R/8 threads per column. */
 template <bool INV>
 __global__ void __launch_bounds__(NTT_THREADS) kCol(uint32_t *__restrict__ X, size_t rows, int logT, int logR,
-                                                     RnsTables t) {
+                                                     RnsTables t, Pad pd) {
   extern __shared__ uint32_t sm[];
   const int R = 1 << logR, COLS = TILE / R, logC = logT - logR;
   const size_t C = (size_t)1 << logC, T = (size_t)1 << logT;
@@ -209,8 +227,13 @@ __global__ void __launch_bounds__(NTT_THREADS) kCol(uint32_t *__restrict__ X, si
   int idx[8], r, sb;
   pass_params(logR, 0, INV, r, sb);
   get_index_set(idx, r, qq, sb);
+  if (!INV && pd.len != SIZE_MAX) {
 #pragma unroll
-  for (int i = 0; i < 8; i++) v[i] = g[(size_t)idx[i] * C];
+    for (int i = 0; i < 8; i++) v[i] = pad_load(pd, g + (size_t)idx[i] * C, (size_t)idx[i] * C + l, p);
+  } else {
+#pragma unroll
+    for (int i = 0; i < 8; i++) v[i] = g[(size_t)idx[i] * C];
+  }
   if (INV) {  // untwist
 #pragma unroll
     for (int i = 0; i < 8; i++) {
@@ -277,18 +300,20 @@ size_t row_smem(int logM) { return ((size_t)(1 << logM) + TILE + TILE / 8) * 4; 
 size_t col_smem(int logR) { return ((size_t)(1 << logR) + TILE + TILE / 8) * 4; }
 
 template <bool INV>
-void launch_row(const RnsContext &ctx, uint32_t *X, size_t nrows, int logM, cudaStream_t s, PreMul pm = PreMul()) {
+void launch_row(const RnsContext &ctx, uint32_t *X, size_t nrows, int logM, cudaStream_t s, PreMul pm = PreMul(),
+                Pad pd = Pad()) {
   const size_t M = (size_t)1 << logM, rows_per_block = TILE / M;
   dim3 grid((unsigned)((nrows + rows_per_block - 1) / rows_per_block), (unsigned)ctx.P());
-  kRow<INV><<<grid, NTT_THREADS, row_smem(logM), s>>>(X, nrows, logM, ctx.tables(), pm);
+  kRow<INV><<<grid, NTT_THREADS, row_smem(logM), s>>>(X, nrows, logM, ctx.tables(), pm, pd);
   CUDA_CHECK(cudaGetLastError());
 }
 
 template <bool INV>
-void launch_col(const RnsContext &ctx, uint32_t *X, size_t rows, int logT, int logR, cudaStream_t s) {
+void launch_col(const RnsContext &ctx, uint32_t *X, size_t rows, int logT, int logR, cudaStream_t s,
+                Pad pd = Pad()) {
   const size_t C = (size_t)1 << (logT - logR), COLS = TILE >> logR;
   dim3 grid((unsigned)(rows * (C / COLS)), (unsigned)ctx.P());
-  kCol<INV><<<grid, NTT_THREADS, col_smem(logR), s>>>(X, rows, logT, logR, ctx.tables());
+  kCol<INV><<<grid, NTT_THREADS, col_smem(logR), s>>>(X, rows, logT, logR, ctx.tables(), pd);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -303,15 +328,28 @@ void check_len(const RnsContext &ctx, int logT) {
 
 }  // namespace
 
-void ntt_forward(const RnsContext &ctx, uint32_t *X, size_t rows, int logT, cudaStream_t s) {
+namespace {
+void forward_pd(const RnsContext &ctx, uint32_t *X, size_t rows, int logT, Pad pd, cudaStream_t s) {
   check_len(ctx, logT);
   if (logT <= 12) {
-    launch_row<false>(ctx, X, rows, logT, s);
+    launch_row<false>(ctx, X, rows, logT, s, PreMul(), pd);
   } else {
     const int logR = split_logR(logT);
-    launch_col<false>(ctx, X, rows, logT, logR, s);
+    launch_col<false>(ctx, X, rows, logT, logR, s, pd);
     launch_row<false>(ctx, X, rows << logR, logT - logR, s);
   }
+}
+}  // namespace
+
+void ntt_forward(const RnsContext &ctx, uint32_t *X, size_t rows, int logT, cudaStream_t s) {
+  forward_pd(ctx, X, rows, logT, Pad(), s);
+}
+
+void ntt_forward_padded(const RnsContext &ctx, uint32_t *X, size_t rows, int logT, size_t lo, size_t len, long lead,
+                        int lead_c, cudaStream_t s) {
+  Pad pd;
+  pd.lo = lo; pd.len = len; pd.lead = lead; pd.lead_c = lead_c;
+  forward_pd(ctx, X, rows, logT, pd, s);
 }
 
 namespace {

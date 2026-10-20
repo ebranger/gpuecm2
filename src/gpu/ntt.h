@@ -18,6 +18,11 @@
 #include "gpu/rns.h"
 
 void ntt_forward(const RnsContext &ctx, uint32_t *X, size_t rows, int logT, cudaStream_t s = 0);
+/* ntt_forward of rows whose positions outside [lo, lo + len) are taken to be
+   0, except lead (if >= 0) which is taken to be lead_c; those positions of X
+   are not read (they need not be initialised). */
+void ntt_forward_padded(const RnsContext &ctx, uint32_t *X, size_t rows, int logT, size_t lo, size_t len, long lead,
+                        int lead_c, cudaStream_t s = 0);
 void ntt_inverse(const RnsContext &ctx, uint32_t *X, size_t rows, int logT, cudaStream_t s = 0);
 
 /* The pointwise products below followed by ntt_inverse, in one pass less:

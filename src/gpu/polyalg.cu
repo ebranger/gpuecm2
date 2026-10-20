@@ -39,8 +39,12 @@ struct Rns {  // a stream-ordered RNS buffer: P x rows x T words
    optionally reversed and shifted (see RnsContext::from_limbs_ex), transformed. */
 void load_fwd(const RnsContext &ctx, Rns &R, const uint32_t *A, size_t ld, const RowMap &map, size_t rows,
               size_t src_len, size_t piece_len, size_t npieces, size_t offset, bool reverse, int lead_pos = -1) {
-  ctx.from_limbs_map(A, ld, map, rows, src_len, piece_len, npieces, R.X, R.T, offset, reverse, R.s, lead_pos);
-  ntt_forward(ctx, R.X, rows * npieces, R.logT, R.s);
+  /* the padding is not written: the transform takes it as zero (and the
+     leading 1, when it falls there) */
+  const bool lead_in = lead_pos >= (long)offset && lead_pos < (long)(offset + piece_len);
+  ctx.from_limbs_map(A, ld, map, rows, src_len, piece_len, npieces, R.X, R.T, offset, reverse, R.s,
+                     lead_in ? lead_pos : -1, 1, false);
+  ntt_forward_padded(ctx, R.X, rows * npieces, R.logT, offset, piece_len, lead_in ? -1 : lead_pos, 1, R.s);
 }
 
 /* single-row cyclic product Z = X * Y (both transformed, length T), returned

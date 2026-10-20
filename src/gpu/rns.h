@@ -97,10 +97,13 @@ class RnsContext {
   }
   /* ... with source row r starting at coefficient src(r) of A; with
      lead_pos >= 0, position lead_pos of every RNS row is lead_c (or gets
-     lead_c added, if it holds a coefficient) */
+     lead_c added, if it holds a coefficient). With pad = false the
+     positions outside [dst_offset, dst_offset + piece_len) are left as they
+     are (for ntt_forward_padded, which treats them as zero; a lead_pos
+     outside that range is then ignored too). */
   void from_limbs_map(const uint32_t *A, size_t ld, const RowMap &src, size_t rows, size_t src_len, size_t piece_len,
                       size_t npieces, uint32_t *X, size_t T, size_t dst_offset, bool reverse,
-                      cudaStream_t s = 0, long lead_pos = -1, int lead_c = 1) const;
+                      cudaStream_t s = 0, long lead_pos = -1, int lead_c = 1, bool pad = true) const;
   /* X[row][pos] += c (mod each prime), c a small signed constant, for all rows */
   void add_const(uint32_t *X, size_t rows, size_t T, size_t pos, int c, cudaStream_t s = 0) const;
 

@@ -673,13 +673,13 @@ int choose_tm(int rows) {
 
 void RnsContext::from_limbs_map(const uint32_t *A, size_t ld, const RowMap &src, size_t rows, size_t src_len,
                                 size_t piece_len, size_t npieces, uint32_t *X, size_t T, size_t dst_offset,
-                                bool reverse, cudaStream_t s, long lead_pos, int lead_c) const {
+                                bool reverse, cudaStream_t s, long lead_pos, int lead_c, bool pad) const {
   const size_t xrows = rows * npieces, K = xrows * piece_len;
   /* the positions outside [dst_offset, dst_offset + piece_len) are written
      here (zeros, and the leading constant if it falls there), the others by
      k_to_rns: every word of X is written once */
   const bool lead_in_data = lead_pos >= (long)dst_offset && lead_pos < (long)(dst_offset + piece_len);
-  if (piece_len < T && xrows) {
+  if (pad && piece_len < T && xrows) {
     const size_t pad = T - piece_len, total = xrows * pad, b = (total + 255) / 256;
     k_pad<<<dim3((unsigned)(b < 8192 ? b : 8192), t_.P), 256, 0, s>>>(X, xrows, T, dst_offset, piece_len,
                                                                       lead_in_data ? -1 : lead_pos, lead_c, t_);
