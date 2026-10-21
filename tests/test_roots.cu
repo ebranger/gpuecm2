@@ -14,6 +14,7 @@
 
 #include "gpu/cuda_check.h"
 #include "gpu/roots.h"
+#include "api/stage2.h"
 #include "host/curve.h"
 #include "host/params.h"
 #include "host/resume.h"
@@ -257,9 +258,50 @@ static void test_roots_vs_ecm(const char *ecm, const char *nstr, int param, unsi
       }
     }
   }
-  printf("%s roots vs GMP-ECM: %zu-bit N, param %d, B2=%s %s: dF=%lu k=%lu d1=%lu d2=%lu i0=%ld S=%d\n",
+  /* the whole stage 2 against GMP-ECM's own roots: gpuecm2's first value and its
+     product over all roots of F (the value whose gcd is the result, which GMP-ECM
+     does not print) against prod (g_j - f_i) computed here from GMP-ECM's roots,
+     and the first value against GMP-ECM's "Product of G(f_i)"; with the
+     self-check, which recomputes some roots on the CPU */
+  const char *whole = "";
+  if (ok && (double)sp.dF * sp.dF * sp.k <= 2e7) {
+    whole = ", whole stage 2 compared";
+    Stage2Engine eng(rec.n.get(), sp);
+    Stage2Outcome o = eng.run(C, false, true);
+    Z fz, gz, d, hi, full, first, ecm_first;
+    std::vector<Z> g(gv.size());
+    for (size_t j = 0; j < gv.size(); j++) mpz_set_str(g[j], gv[j].c_str(), 10);
+    mpz_set_ui(full, 1);
+    for (size_t i = 0; i < fv.size(); i++) {
+      mpz_set_str(fz, fv[i].c_str(), 10);
+      mpz_set_ui(hi, 1);
+      for (size_t j = 0; j < g.size(); j++) {
+        mpz_sub(d, g[j], fz);
+        mpz_mul(hi, hi, d);
+        mpz_mod(hi, hi, rec.n);
+      }
+      if (i == 0) mpz_set(first, hi);
+      mpz_mul(full, full, hi);
+      mpz_mod(full, full, rec.n);
+    }
+    const size_t at = trace.find("Product of G(f_i) = ");
+    const bool have_ecm = at != std::string::npos;
+    if (have_ecm) mpz_set_str(ecm_first, trace.substr(at + 20, trace.find('\n', at) - at - 20).c_str(), 10);
+    else whole = ", whole stage 2 compared (GMP-ECM printed no Product of G(f_i))";
+    Z gcd;
+    mpz_gcd(gcd, full, rec.n);
+    const bool full_ok = o.have_full && mpz_cmp(o.full_product, full) == 0;
+    const bool first_ok = o.have_first && mpz_cmp(o.first_value, first) == 0 && (!have_ecm || mpz_cmp(first, ecm_first) == 0);
+    const bool status_ok = !o.check_failed && (mpz_cmp_ui(gcd, 1) == 0 ? o.status == 0 : o.status == 2);
+    if (!(full_ok && first_ok && status_ok))
+      printf("  stage 2 against GMP-ECM's roots: full product %s, first value %s%s, status %d%s\n", full_ok ? "same" : "DIFFERS",
+             first_ok ? "same" : "DIFFERS", have_ecm ? "" : " (GMP-ECM printed none)", o.status,
+             o.check_failed ? " (self-check failed)" : "");
+    ok &= full_ok && first_ok && status_ok;
+  }
+  printf("%s roots vs GMP-ECM: %zu-bit N, param %d, B2=%s %s: dF=%lu k=%lu d1=%lu d2=%lu i0=%ld S=%d%s\n",
          ok ? "ok  " : "FAIL", mpz_sizeinbase(rec.n.get(), 2), param, B2, sopt, sp.dF, sp.k, sp.d1, sp.d2,
-         mpz_get_si(sp.i0.get()), sp.S);
+         mpz_get_si(sp.i0.get()), sp.S, whole);
   failures += !ok;
 }
 

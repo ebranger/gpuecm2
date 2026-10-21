@@ -63,7 +63,9 @@ The options mean what they mean for `ecm` (stage 2 only). In addition:
 - `-v -v` prints GMP-ECM's "Product of G(f_i)" value when no factor is found; `-v -v -v` adds
   per-phase times (measuring them serialises the GPU work, so step 2 gets slightly slower).
 - `-selfcheck` verifies each curve's stage 2 at random points (product trees, and the final
-  values at a few roots of F), at a cost of a few percent. Off by default.
+  values at a few roots of F), and recomputes a few roots (two of F and one of each block of
+  G, of the first curve of each batch) on the CPU with an independent method, at a cost of
+  5–20%. Off by default.
 - `-treecache` keeps the transforms of F's product tree for the final evaluation, which makes
   stage 2 2–6% faster for numbers of up to 1920 bits, at the cost of GPU memory: per curve,
   0.4 GB at 512 bits and 0.8 GB at 1024 bits for B1 = 11e7, 1.6 GB at 1024 bits for 26e7

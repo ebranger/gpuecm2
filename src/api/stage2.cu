@@ -19,6 +19,77 @@
 
 namespace {
 double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+
+/* For the self-check: the root x(f(v) P) computed on the CPU, independently
+   of the GPU's root generation (Edwards finite differences): the scalar
+   |f(v)| (Dickson_{-S,-1} or x^S), an x-only Montgomery ladder on
+   B y^2 = u^3 + A u^2 + u for u(|f(v)| P), then GMP-ECM's Weierstrass
+   x = (3u + A) / (3B); 0 for the point at infinity, as in GMP-ECM. Returns
+   false if a value is not invertible (then the GPU reports a factor). */
+bool cpu_root(const MontgomeryCurve &C, int S, const mpz_t v, mpz_t out) {
+  mpz_srcptr n = C.n.get();
+  Z k, a24, X2, Z2, X3, Z3, t1, t2, t3, t4, b;
+  if (S < 0) dickson(k, v, (unsigned)-S, -1);
+  else mpz_pow_ui(k, v, (unsigned long)S);
+  mpz_abs(k, k);
+  mpz_set_ui(t1, 4);
+  if (!mpz_invert(t1, t1, n)) return false;
+  mpz_add_ui(a24, C.A, 2);
+  mpz_mul(a24, a24, t1);
+  mpz_mod(a24, a24, n);  // (A + 2) / 4
+  mpz_set_ui(X2, 1); mpz_set_ui(Z2, 0);  // R0 = m P (m = 0: infinity)
+  mpz_set(X3, C.u); mpz_set_ui(Z3, 1);   // R1 = (m + 1) P, R1 - R0 = P = (u : 1)
+  for (long i = (long)mpz_sizeinbase(k, 2) - 1; i >= 0; i--) {
+    const bool bit = mpz_tstbit(k, i);
+    if (bit) { mpz_swap(X2, X3); mpz_swap(Z2, Z3); }
+    /* R1 := R0 + R1 (difference P), R0 := 2 R0 */
+    mpz_sub(t1, X2, Z2); mpz_add(t2, X3, Z3); mpz_mul(t1, t1, t2);  // U = (X0 - Z0)(X1 + Z1)
+    mpz_add(t3, X2, Z2); mpz_sub(t4, X3, Z3); mpz_mul(t3, t3, t4);  // V = (X0 + Z0)(X1 - Z1)
+    mpz_add(t2, t1, t3); mpz_mul(t2, t2, t2); mpz_mod(X3, t2, n);   // (U + V)^2
+    mpz_sub(t2, t1, t3); mpz_mul(t2, t2, t2); mpz_mod(t2, t2, n);
+    mpz_mul(t2, t2, C.u); mpz_mod(Z3, t2, n);                        // u (U - V)^2
+    mpz_add(t1, X2, Z2); mpz_mul(t1, t1, t1); mpz_mod(t1, t1, n);   // (X0 + Z0)^2
+    mpz_sub(t3, X2, Z2); mpz_mul(t3, t3, t3); mpz_mod(t3, t3, n);   // (X0 - Z0)^2
+    mpz_mul(X2, t1, t3); mpz_mod(X2, X2, n);
+    mpz_sub(t1, t1, t3);                                             // C = sum^2 - diff^2
+    mpz_mul(t4, a24, t1); mpz_add(t4, t4, t3); mpz_mul(t4, t4, t1); mpz_mod(Z2, t4, n);
+    if (bit) { mpz_swap(X2, X3); mpz_swap(Z2, Z3); }
+  }
+  if (mpz_sgn(Z2.get()) == 0) {
+    mpz_set_ui(out, 0);
+    return true;
+  }
+  if (!mpz_invert(t1, Z2, n)) return false;
+  mpz_mul(t1, t1, X2); mpz_mod(t1, t1, n);  // u of |f(v)| P
+  mpz_mul(b, C.u, C.u); mpz_mul(t2, C.A, C.u); mpz_add(b, b, t2); mpz_add_ui(b, b, 1);
+  mpz_mul(b, b, C.u); mpz_mul_ui(b, b, 3); mpz_mod(b, b, n);  // 3B = 3 (u0^3 + A u0^2 + u0)
+  if (!mpz_invert(b, b, n)) return false;
+  mpz_mul_ui(t1, t1, 3); mpz_add(t1, t1, C.A); mpz_mul(t1, t1, b); mpz_mod(out, t1, n);
+  return true;
+}
+
+/* the argument v (j d2 for F, i d1 for G) of output idx of a root plan */
+bool plan_argument(const ProgressionPlan &P, bool isF, const Stage2Params &sp, size_t idx, mpz_t v) {
+  for (size_t p = 0; p < P.nprog; p++) {
+    size_t n = SIZE_MAX;
+    if (!P.slot.empty()) {
+      for (size_t m = 0; m < P.steps; m++)
+        if (P.slot[m * P.nprog + p] == (int32_t)idx) { n = m; break; }
+    } else if (P.inc > 0) {
+      const int64_t d = (int64_t)idx - P.base[p];
+      if (d >= 0 && d % P.inc == 0 && (uint64_t)(d / P.inc) < P.steps) n = (size_t)(d / P.inc);
+    }
+    if (n == SIZE_MAX) continue;
+    Z t;
+    mpz_set_ui(v, (unsigned long)P.arg_step);
+    mpz_mul_ui(v, v, (unsigned long)n);
+    mpz_add_ui(v, v, (unsigned long)P.arg0[p]);
+    if (!isF) mpz_add(v, v, sp.i0.get());
+    mpz_mul_ui(v, v, isF ? sp.d2 : sp.d1);
+    return true;
+  }
+  return false;
+}
 int clog2(size_t n) { int k = 0; while (((size_t)1 << k) < n) k++; return k; }
 /* Number of progressions per curve for a root plan of `count` roots f(v) P
    with v up to vmax, for `batch` curves sharing the GPU, given that `cap`
@@ -277,6 +348,14 @@ std::vector<Stage2Outcome> Stage2Engine::run_batch(const MontgomeryCurve *Cs, si
       mpz_set_ui(K.acc[t].get(), 1);
     }
     gmp_randclear(rs);
+    if (c == 0)  // the root generation itself: two roots of F recomputed on the CPU
+      for (int t = 0; t < 2 && t < NCHK; t++) {
+        Z v, f, cf;
+        mpz_sub(f, n_.get(), K.x[1 + t].get());
+        mpz_mod(f, f, n_.get());
+        if (plan_argument(pl.F, true, sp_, K.idx[t], v) && cpu_root(Cs[0], sp_.S, v, cf))
+          K.ok &= mpz_cmp(f, cf) == 0;
+      }
     Z fr;
     mpz_srcptr rr = K.x[0].get();
     mpz_ptr pr = K.val[0].get();
@@ -304,6 +383,22 @@ std::vector<Stage2Outcome> Stage2Engine::run_batch(const MontgomeryCurve *Cs, si
       lap(tm.rootsG);
       if (r != ROOTS_OK) break;
       after(sp, sr, ev_[1 + b % 2]);
+      if (!chk.empty()) {  // the root generation itself: one root of this block of the first curve on the CPU
+        const size_t i = (b * 7919 + 101) % dF;
+        std::vector<uint32_t> w(nl);
+        CUDA_CHECK(cudaMemcpy2DAsync(w.data(), 4, Gb[b % 2] + i, N * 4, 4, nl, cudaMemcpyDeviceToHost, sp));
+        CUDA_CHECK(cudaStreamSynchronize(sp));
+        if (const char *fi = getenv("GPUECM2_INJECT_FAULT"))  // testing aid: 3: a wrong root of G, used
+          if (atoi(fi) == 3 && b == 0) {                     // consistently (only this check sees it)
+            w[0] ^= 1;
+            CUDA_CHECK(cudaMemcpyAsync(Gb[b % 2] + i, w.data(), 4, cudaMemcpyHostToDevice, sp));
+            CUDA_CHECK(cudaStreamSynchronize(sp));
+          }
+        Z gv, v, cg;
+        mpz_import(gv, nl, -1, 4, 0, 0, w.data());
+        if (plan_argument(pl.G, false, sp_, b * dF + i, v) && cpu_root(Cs[0], sp_.S, v, cg))
+          chk[0].ok &= mpz_cmp(gv, cg) == 0;
+      }
       tree_build(ctx, Gb[b % 2], dF, G, nullptr, sp, B);
       for (size_t c = 0; c < chk.size(); c++) {  // G(r) = prod (r + g_j); accumulate prod (g_j - f_i)
         Check &K = chk[c];
@@ -365,9 +460,13 @@ std::vector<Stage2Outcome> Stage2Engine::run_batch(const MontgomeryCurve *Cs, si
       }
   }
   std::vector<Z> g(B);
-  std::vector<mpz_ptr> gp(B);
-  for (size_t c = 0; c < B; c++) gp[c] = g[c].get();
-  product_gcd_batch(ctx, n_.get(), V, dF, B, gp.data(), sp);
+  std::vector<mpz_ptr> gp(B), pp(B);
+  for (size_t c = 0; c < B; c++) {
+    gp[c] = g[c].get();
+    pp[c] = outs[c].full_product.get();
+    outs[c].have_full = true;
+  }
+  product_gcd_batch(ctx, n_.get(), V, dF, B, gp.data(), sp, pp.data());
   lap(tm.prod);
   free_all();
   sync();

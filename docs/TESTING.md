@@ -18,9 +18,15 @@ implementation changes behaviour (boundary tests).
 | `gmp-ecm/test_gpu2.py` | GPU, the `ecm` of `gmp-ecm/build_ecm.sh` | 3 min | the full GPU build of GMP-ECM: `-gpu2` gives the same result as GMP-ECM's CPU stage 2 for every curve of a GPU stage 1 run (512, 1024 and 2048 bits) |
 
 "Same results" means the same factor, or the same `Product of G(f_i)` value that GMP-ECM
-prints at `-v -v` when no factor is found. That value is H(-f_0), which depends on every root
-of F and G and on every polynomial product, inversion and reduction, so a single wrong
-coefficient anywhere changes it.
+prints at `-v -v` when no factor is found. That value is H(-f_0) = the product over all
+blocks and all roots g_j of G of (g_j - f_0). It depends on f_0, on every root of G and on
+the polynomial products, inversions and reductions (a wrong coefficient in them changes it),
+but not on the other roots of F: a wrong root f_i (i > 0) that is used consistently leaves
+it unchanged. Those are covered by `test_roots <ecm>`, which compares every root of F and G
+with GMP-ECM's own and, for the smaller cases, compares gpuecm2's product of H(-f_i) over all
+roots of F (whose gcd with N is the result) with the product of (g_j - f_i) computed from
+GMP-ECM's roots; and, in production runs, by the self-check, which recomputes some roots on
+the CPU.
 
 The scripts that need GMP-ECM take its path as an argument (`ecm` 7.x; the tests were run with
 7.0.6) and limit its memory use. Nothing is run in parallel.
@@ -83,7 +89,8 @@ python3 tests/boundary_tests.py build/gpuecm2 /path/to/ecm [--heavy] [--only REG
 ## Long runs
 
 Stage 2s too large for GMP-ECM on this machine were run with `-selfcheck` (product trees and
-final values checked at random points):
+final values checked at random points; these runs were made before the self-check also
+recomputed roots on the CPU):
 
 - 4095 bits, B1 = 25e9 (default B2 = 1.8e15, `-maxmem 8000`): dF = 259200, k = 2240 blocks;
   self-check passed, same "Product of G(f_i)" as an earlier run with the previous root
@@ -116,8 +123,9 @@ Environment variables read by the stage 2 engine (for tests only):
 
 - `GPUECM2_MAX_LOGT=n`: use NTTs of length at most 2^n (n >= 12).
 - `GPUECM2_GPU_MEM=MB`: pretend that this much GPU memory is usable.
-- `GPUECM2_INJECT_FAULT=1|2`: corrupt one coefficient (of H before the evaluation, or of F),
-  to check that `-selfcheck` catches it.
+- `GPUECM2_INJECT_FAULT=1|2|3`: corrupt one coefficient (of H before the evaluation, or of F),
+  or one root of G before G is built (a consistently wrong root, which only the self-check's
+  CPU recomputation of roots can see), to check that `-selfcheck` catches it.
 - `GPUECM2_PARAMS_ONLY=1`: print the stage 2 parameters of each residue, run no stage 2.
 - `GPUECM2_TO_LIMBS=dot|cs|tiled`: force one of the RNS-to-limbs kernels (benchmarks).
 - `GPUECM2_TREE_CACHE_LEVELS=n`: with `-treecache`, keep the transforms of at most n tree

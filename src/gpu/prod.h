@@ -13,9 +13,10 @@
 /* g := gcd(prod V_i, n) for count residues in limb array V (leading dimension count) */
 void product_gcd(const RnsContext &ctx, const mpz_t n, const uint32_t *V, size_t count, mpz_t g,
                  cudaStream_t s = 0);
-/* g[c] := gcd(prod_i V_{c*count + i}, n) for c < batch (leading dimension batch*count) */
+/* g[c] := gcd(prod_i V_{c*count + i}, n) for c < batch (leading dimension batch*count);
+   with prod, also prod[c] := prod_i V_{c*count + i} mod n (canonical) */
 void product_gcd_batch(const RnsContext &ctx, const mpz_t n, const uint32_t *V, size_t count, size_t batch,
-                       mpz_ptr *g, cudaStream_t s = 0);
+                       mpz_ptr *g, cudaStream_t s = 0, mpz_ptr *prod = nullptr);
 
 /* For the self-check. out := sum_{i<len} coef[i] x^i (+ x^len if monic) mod n,
    coef a limb array with leading dimension ld. */

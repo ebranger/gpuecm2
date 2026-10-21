@@ -194,7 +194,12 @@ arithmetic; none of them is implemented.
   each product tree is evaluated at a random point r and compared with ∏(r + root), and the
   final values H(−f_i) at a few random roots of F are compared with ∏ (g_j − f_i) over all
   blocks (reduction mod F keeps the values at F's roots, so this covers the products mod F
-  and the transposed evaluation). Costs 5–20%, mostly synchronisation.
+  and the transposed evaluation). Those checks use the GPU's roots on both sides, so the root
+  generation is checked separately: two roots of F and one root of each block of G of the
+  first curve of each batch are recomputed on the CPU (the scalar f(v), an x-only Montgomery
+  ladder in GMP, GMP-ECM's Weierstrass x), independently of the GPU's Edwards finite
+  differences. Costs 5–20% (measured 11–18% at B1 = 11e7 parameters, of which the CPU
+  roots are 6–10%).
 - For HIP portability, keep inline PTX in one arithmetic header with portable fallbacks,
   make no warp-size-32 assumptions in our own kernels, and keep CGBN behind a wrapper.
   Review (M6): our kernels use no warp intrinsics and no PTX outside `arith32.cuh` (which has

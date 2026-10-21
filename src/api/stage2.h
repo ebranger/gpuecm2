@@ -31,6 +31,10 @@ struct Stage2Outcome {
   Z factor;
   Z first_value;     // H(-f_0), what GMP-ECM prints as "Product of G(f_i)" at -v -v
   bool have_first = false;
+  /* prod_i H(-f_i) = prod over all roots f_i of F and g_j of G of (g_j - f_i)
+     mod n, whose gcd with n is the result; for tests (GMP-ECM does not print it) */
+  Z full_product;
+  bool have_full = false;
   Stage2Times t;
 };
 

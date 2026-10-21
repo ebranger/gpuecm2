@@ -61,7 +61,7 @@ static void run_case(int bits, double B1, int S) {
               mpz_cmp(plain.first_value.get(), checked.first_value.get()) == 0,
           what);
   }
-  for (const char *fault : {"1", "2"}) {
+  for (const char *fault : {"1", "2", "3"}) {
     set_env("GPUECM2_INJECT_FAULT", fault);
     Stage2Outcome o = eng.run(C, false, true);
     set_env("GPUECM2_INJECT_FAULT", nullptr);

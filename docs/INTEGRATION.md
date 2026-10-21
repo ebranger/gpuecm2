@@ -50,8 +50,8 @@ gpuecm2_params_clear(p);
   what makes small stage 2s fast (see docs/BENCHMARKS.md).
 - `gpuecm2_stage2_new` costs some milliseconds (NTT primes, root plans). Keep the engine
   while the number and parameters stay the same.
-- `GPUECM2_SELFCHECK` verifies each curve's product trees and final values at random points
-  (a few percent slower).
+- `GPUECM2_SELFCHECK` verifies each curve's product trees and final values at random points,
+  and a few roots of the first curve of each batch against a CPU computation (5–20% slower).
 - Not thread-safe: call from one thread (one engine per thread and GPU does work, but the
   default CUDA device of each thread must be set with `gpuecm2_set_device`).
 - A CUDA error (e.g. the GPU disappears) terminates the process with a message, as

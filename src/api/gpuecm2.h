@@ -45,7 +45,8 @@ extern "C" {
 #define GPUECM2_CHECK_FAILED (-2) /* GPUECM2_SELFCHECK found an inconsistency (GPU fault) */
 
 /* flags of gpuecm2_stage2_run */
-#define GPUECM2_SELFCHECK 1u     /* verify product trees and final values at random points (a few % slower) */
+#define GPUECM2_SELFCHECK 1u     /* verify product trees and final values at random points, and a few roots
+                                    against a CPU computation (5-20% slower) */
 #define GPUECM2_TREE_CACHE 2u    /* keep the transforms of F's product tree for the evaluation: 2-6% faster for
                                     moduli up to 1920 bits, more GPU memory (as far as free; see gpuecm2 -h) */
 

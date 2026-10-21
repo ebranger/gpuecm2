@@ -53,7 +53,7 @@ unsigned grid_for(size_t instances, uint32_t tpi) { return (unsigned)((instances
 
 template <uint32_t TPI, uint32_t BITS>
 void run(const RnsContext &ctx, const mpz_t n, const uint32_t *V, size_t count, size_t batch, mpz_ptr *g,
-         cudaStream_t s) {
+         cudaStream_t s, mpz_ptr *prod) {
   typedef cgbn_mem_t<BITS> mem_t;
   mem_t hn, *dn, *M, *T1, *T2;
   for (auto &w : hn._limbs) w = 0;
@@ -77,7 +77,12 @@ void run(const RnsContext &ctx, const mpz_t n, const uint32_t *V, size_t count, 
   std::vector<mem_t> h(B * c2);
   CUDA_CHECK(cudaMemcpyAsync(h.data(), T2, sizeof(mem_t) * B * c2, cudaMemcpyDeviceToHost, s));
   CUDA_CHECK(cudaStreamSynchronize(s));
-  Z p, v;
+  Z p, v, Rk;
+  if (prod) {  // the chunk products carry R^-(count - c2): R^(count - c2) gives the plain product
+    mpz_set_ui(Rk, 1);
+    mpz_mul_2exp(Rk, Rk, BITS);
+    mpz_powm_ui(Rk, Rk, count - c2, n);
+  }
   for (size_t c = 0; c < B; c++) {
     mpz_set_ui(p, 1);
     for (size_t i = 0; i < c2; i++) {
@@ -86,6 +91,10 @@ void run(const RnsContext &ctx, const mpz_t n, const uint32_t *V, size_t count, 
       mpz_mod(p, p, n);
     }
     mpz_gcd(g[c], p, n);
+    if (prod) {
+      mpz_mul(prod[c], p, Rk);
+      mpz_mod(prod[c], prod[c], n);
+    }
   }
   for (void *q : {(void *)dn, (void *)M, (void *)T1, (void *)T2}) cudaFreeAsync(q, s);
 }
@@ -251,11 +260,14 @@ void product_gcd(const RnsContext &ctx, const mpz_t n, const uint32_t *V, size_t
 }
 
 void product_gcd_batch(const RnsContext &ctx, const mpz_t n, const uint32_t *V, size_t count, size_t batch,
-                       mpz_ptr *g, cudaStream_t s) {
+                       mpz_ptr *g, cudaStream_t s, mpz_ptr *prod) {
   if (batch == 0) return;
   if (count == 0) {
-    for (size_t c = 0; c < batch; c++) mpz_set(g[c], n);
+    for (size_t c = 0; c < batch; c++) {
+      mpz_set(g[c], n);
+      if (prod) mpz_set_ui(prod[c], 0);
+    }
     return;
   }
-  GPUECM2_CGBN_DISPATCH(mpz_sizeinbase(n, 2), run, ctx, n, V, count, batch, g, s);
+  GPUECM2_CGBN_DISPATCH(mpz_sizeinbase(n, 2), run, ctx, n, V, count, batch, g, s, prod);
 }
