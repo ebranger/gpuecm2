@@ -103,3 +103,9 @@ struct AffinePoint {
 };
 bool ec_test_ops(const MontgomeryCurve &C, const AffinePoint &P, const AffinePoint &Q, AffinePoint &R,
                  AffinePoint &D, AffinePoint &M);
+
+/* For tests: the root generator's batch inversion on the GPU, for canonical
+   residues v mod n (0 marks an unused slot): ROOTS_OK with inv[i] = 1/v[i],
+   or ROOTS_FACTOR with factor = gcd(v[i], n) for the first v[i] that is not
+   invertible. */
+int batch_inverse_test(const mpz_t n, const std::vector<Z> &v, std::vector<Z> &inv, mpz_t factor);

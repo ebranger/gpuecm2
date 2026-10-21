@@ -85,6 +85,46 @@ static void test_formulas(int bits) {
   failures += !ok;
 }
 
+/* The root generator's batch inversion: correct inverses (zeros are unused
+   slots), and for values that are not invertible the gcd of the first one,
+   also when two of them multiply to 0 mod N = p q (one divisible by p, the
+   other by q) in the same chunk or the same higher-level product. */
+static void test_batch_inverse(int bits) {
+  Z p, q, n, f, t;
+  mpz_urandomb(p, rs, bits / 2); mpz_setbit(p, bits / 2 - 1); mpz_nextprime(p, p);
+  mpz_urandomb(q, rs, bits - bits / 2); mpz_setbit(q, bits - bits / 2 - 1); mpz_nextprime(q, q);
+  mpz_mul(n, p, q);
+  bool ok = true;
+  for (size_t count : {20, 64, 300, 5000}) {  // host only; one, two, three GPU levels (chunks of 8)
+    std::vector<Z> v(count), inv;
+    for (size_t i = 0; i < count; i++)
+      if (i % 7 != 3) do mpz_urandomm(v[i], rs, n); while (mpz_sgn(v[i]) == 0 || (mpz_gcd(t, v[i], n), mpz_cmp_ui(t, 1) != 0));
+    int r = batch_inverse_test(n, v, inv, f);
+    bool good = r == ROOTS_OK;
+    for (size_t i = 0; good && i < count; i++)
+      if (mpz_sgn(v[i])) { mpz_mul(t, v[i], inv[i]); mpz_mod(t, t, n); good = mpz_cmp_ui(t, 1) == 0; }
+    if (!good) printf("  batch inverse, %zu values: wrong inverses (status %d)\n", count, r);
+    ok &= good;
+    /* (index of a multiple of p, index of a multiple of q or none) */
+    const std::pair<size_t, size_t> cases[] = {{16, 17}, {16, 40}, {5, count - 2}, {count / 2, SIZE_MAX}};
+    for (auto c : cases) {
+      if (c.first >= count || (c.second != SIZE_MAX && c.second >= count)) continue;
+      std::vector<Z> w(count);
+      for (size_t i = 0; i < count; i++) mpz_set(w[i], v[i]);
+      mpz_urandomm(t, rs, q); mpz_add_ui(t, t, 1); mpz_mul(w[c.first], p, t);   // p * (1..q): nonzero mod n
+      if (c.second != SIZE_MAX) { mpz_urandomm(t, rs, p); mpz_add_ui(t, t, 1); mpz_mul(w[c.second], q, t); }
+      mpz_set_ui(f, 0);
+      r = batch_inverse_test(n, w, inv, f);
+      const bool g2 = r == ROOTS_FACTOR && mpz_cmp(f, p) == 0;
+      if (!g2) gmp_printf("  batch inverse, %zu values, multiples of p at %zu and of q at %zu: status %d, factor %Zd "
+                          "(expected p)\n", count, c.first, c.second, r, f.get());
+      ok &= g2;
+    }
+  }
+  printf("%s batch inversion, %d-bit N = p q\n", ok ? "ok  " : "FAIL", bits);
+  failures += !ok;
+}
+
 /* k*P mod N (affine, k may be negative); returns false if an inversion fails */
 static bool host_mul(AffPt &R, const AffPt &P, const mpz_t k_in, const mpz_t a, const mpz_t N) {
   Z k;
@@ -235,6 +275,8 @@ int main(int argc, char **argv) {
   for (int bits : {64, 500, 512, 600, 768, 1000, 1024, 1100, 1280, 1500, 1536, 1700, 1792, 2000, 2048, 2300, 2560,
                    3000, 3072, 3300, 3584, 4000, 4096, 4500, 4608})
     if (bits <= maxbits) test_formulas(bits);
+  for (int bits : {200, 1000, 2000, 4000})
+    if (bits <= maxbits) test_batch_inverse(bits);
   if (argc > 1) {
     const char *ecm = argv[1];
     const char *n154 = "2025465328936207440818703294301272886064421597821177778962584974524173076992682818130942359552750438209930281680713872986662397903964218259128794011267773";

@@ -230,10 +230,13 @@ __global__ void __launch_bounds__(BLOCK, step_min_blocks(TPI, BITS)) k_step(cons
   store_pt(E, A, WX, WY, WZ, WT, base);
 }
 
-/* prefix products over chunks of `chunk` values (zero values count as 1) */
+/* prefix products over chunks of `chunk` values. With zero_is_one (the
+   original inputs, where 0 marks an unused slot or the point at infinity)
+   zero values count as 1; on the higher levels a zero is a product of
+   non-invertible values and must stay zero. */
 template <uint32_t TPI, uint32_t BITS>
 __global__ void k_chunk_prefix(const cgbn_mem_t<BITS> *cur, uint32_t np0, const cgbn_mem_t<BITS> *V, size_t count,
-                               size_t chunk, cgbn_mem_t<BITS> *PRE, cgbn_mem_t<BITS> *TOT) {
+                               size_t chunk, cgbn_mem_t<BITS> *PRE, cgbn_mem_t<BITS> *TOT, bool zero_is_one) {
   typedef K<TPI, BITS> T;
   const size_t c = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) / TPI;
   if (c * chunk >= count) return;
@@ -245,7 +248,7 @@ __global__ void k_chunk_prefix(const cgbn_mem_t<BITS> *cur, uint32_t np0, const 
   const size_t end = (c + 1) * chunk < count ? (c + 1) * chunk : count;
   for (size_t i = c * chunk; i < end; i++) {
     cgbn_load(E.env, z, mp(&V[i]));
-    if (E.is_zero(z)) cgbn_set(E.env, z, one);
+    if (zero_is_one && E.is_zero(z)) cgbn_set(E.env, z, one);
     E.mul(acc, acc, z);
     cgbn_store(E.env, &PRE[i], acc);
   }
@@ -427,13 +430,16 @@ cgbn_mem_t<BITS> *upload_consts(const EdwardsModel *Ms, size_t count, cudaStream
   return d;
 }
 
-/* INV[i] = 1/V[i] (Montgomery form in and out; V[i] == 0 is treated as 1).
+/* INV[i] = 1/V[i] (Montgomery form in and out; V[i] == 0 marks an unused
+   slot or the point at infinity and is treated as 1).
    Levels of chunked prefix products on the GPU until at most HOST_INV values
    remain, which are inverted on the host. The first chunk size adapts to the
    count (long chunks for throughput when there is enough parallelism, short
    ones otherwise); later levels use short chunks to keep the sequential
-   chains short. Returns ROOTS_FACTOR (gcd in factor) if some V[i] is not
-   invertible. */
+   chains short. Returns ROOTS_FACTOR if some V[i] is not invertible, with
+   factor = gcd(V[i], n) for the first such (nonzero) V[i]: a product of
+   values can be zero mod n (one value divisible by p, another by q), so the
+   gcd of the products would not do. */
 template <uint32_t TPI, uint32_t BITS>
 int batch_inverse(const cgbn_mem_t<BITS> *cur, uint32_t np0, const mpz_t n, const cgbn_mem_t<BITS> *V, size_t count,
                   cgbn_mem_t<BITS> *INV, mpz_t factor, cudaStream_t s) {
@@ -451,7 +457,8 @@ int batch_inverse(const cgbn_mem_t<BITS> *cur, uint32_t np0, const mpz_t n, cons
     Level L{v, inv, cnt, chunk, dmalloc<mem_t>(cnt, s), dmalloc<mem_t>(nch, s)};
     tmp.push_back(L.PRE);
     tmp.push_back(L.TOT);
-    k_chunk_prefix<TPI, BITS><<<grid_for(nch, TPI), BLOCK, 0, s>>>(cur, np0, L.V, cnt, chunk, L.PRE, L.TOT);
+    k_chunk_prefix<TPI, BITS><<<grid_for(nch, TPI), BLOCK, 0, s>>>(cur, np0, L.V, cnt, chunk, L.PRE, L.TOT,
+                                                                   lv.empty());
     CUDA_CHECK(cudaGetLastError());
     lv.push_back(L);
     v = L.TOT;
@@ -469,13 +476,27 @@ int batch_inverse(const cgbn_mem_t<BITS> *cur, uint32_t np0, const mpz_t n, cons
   mpz_mod(R2, R2, n);
   for (size_t i = 0; i < cnt; i++) {
     from_mem(x, ht[i]);  // Montgomery form T*R
-    if (mpz_sgn(x.get()) == 0) {  // zero counts as one: 1 -> R
+    if (mpz_sgn(x.get()) == 0 && lv.empty()) {  // an original input: zero counts as one, 1 -> R
       mpz_set_ui(one, 1);
       mpz_mul_2exp(one, one, BITS);
       mpz_mod(x, one, n);
     }
     if (!mpz_invert(xi, x, n)) {
-      mpz_gcd(factor, x, n);
+      /* the factor: the gcd of the first original value that is not
+         invertible (gcd(V R, n) = gcd(V, n)) */
+      std::vector<mem_t> hv(count);
+      CUDA_CHECK(cudaMemcpyAsync(hv.data(), V, sizeof(mem_t) * count, cudaMemcpyDeviceToHost, s));
+      CUDA_CHECK(cudaStreamSynchronize(s));
+      mpz_gcd(factor, x, n);  // (not reached: some nonzero V[i] is not invertible)
+      for (size_t j = 0; j < count; j++) {
+        from_mem(x, hv[j]);
+        if (mpz_sgn(x.get()) == 0) continue;
+        mpz_gcd(xi, x, n);
+        if (mpz_cmp_ui(xi, 1) != 0) {
+          mpz_set(factor, xi);
+          break;
+        }
+      }
       ret = ROOTS_FACTOR;
       break;
     }
@@ -743,6 +764,46 @@ void run_test_ops(bool *ok, const MontgomeryCurve &C, const AffinePoint &P, cons
   *ok = get(11, R) && get(15, D) && get(19, Mx);
 }
 
+/* batch_inverse on canonical residues v (0: an unused slot), for tests */
+template <uint32_t TPI, uint32_t BITS>
+void run_batch_inverse_test(int *ret, const mpz_t n, const std::vector<Z> *v, std::vector<Z> *inv, mpz_t factor) {
+  typedef cgbn_mem_t<BITS> mem_t;
+  *ret = ROOTS_ERROR;
+  MontgomeryCurve C;  // any curve: only the modulus constants are used
+  mpz_set(C.n, n);
+  mpz_set_ui(C.A, 5);
+  mpz_set_ui(C.u, 7);
+  Z fac;
+  EdwardsModel M;
+  if (M.init(C, fac) != ROOTS_OK) return;
+  const size_t count = v->size();
+  Z RR, iR, t;
+  mpz_set_ui(RR, 1);
+  mpz_mul_2exp(RR, RR, BITS);
+  mpz_mod(RR, RR, n);
+  mpz_invert(iR, RR, n);
+  std::vector<mem_t> h(count);
+  for (size_t i = 0; i < count; i++) {
+    mpz_mul(t, (*v)[i], RR);
+    mpz_mod(t, t, n);
+    to_mem(h[i], t.get());
+  }
+  mem_t *cur = upload_consts<BITS>(&M, 1, 0);
+  mem_t *dv = dmalloc<mem_t>(count, 0), *di = dmalloc<mem_t>(count, 0);
+  CUDA_CHECK(cudaMemcpy(dv, h.data(), sizeof(mem_t) * count, cudaMemcpyHostToDevice));
+  *ret = batch_inverse<TPI, BITS>(cur, np0_of(n), n, dv, count, di, factor, 0);
+  CUDA_CHECK(cudaMemcpy(h.data(), di, sizeof(mem_t) * count, cudaMemcpyDeviceToHost));
+  inv->resize(count);
+  for (size_t i = 0; i < count; i++) {
+    from_mem((*inv)[i], h[i]);
+    mpz_mul((*inv)[i], (*inv)[i], iR);
+    mpz_mod((*inv)[i], (*inv)[i], n);
+  }
+  dfree(dv, 0);
+  dfree(di, 0);
+  dfree(cur, 0);
+}
+
 template <uint32_t TPI, uint32_t BITS>
 void step_capacity(size_t *out) {
   int dev = 0, sms = 0, blocks = 0;
@@ -894,4 +955,10 @@ bool ec_test_ops(const MontgomeryCurve &C, const AffinePoint &P, const AffinePoi
   bool ok = false;
   GPUECM2_CGBN_DISPATCH(mpz_sizeinbase(C.n.get(), 2), run_test_ops, &ok, C, P, Q, R, D, M);
   return ok;
+}
+
+int batch_inverse_test(const mpz_t n, const std::vector<Z> &v, std::vector<Z> &inv, mpz_t factor) {
+  int ret = ROOTS_ERROR;
+  GPUECM2_CGBN_DISPATCH(mpz_sizeinbase(n, 2), run_batch_inverse_test, &ret, n, &v, &inv, factor);
+  return ret;
 }
