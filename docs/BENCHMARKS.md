@@ -149,7 +149,10 @@ list (512, 1024, 1536, 2048, 3072, 4096 bits) has none for the 4095-bit number. 
 measurement GMP-ECM was built with additional kernel sizes (768, 1280, 2560, 4608 bits:
 the smallest that CGBN compiles above N + 6 for each number; 640 and 2304 are not supported
 by CGBN's division code), and its residues were checked to equal GMP-ECM's CPU stage 1.
-Stage 2 is gpuecm2's batched time per curve at GMP-ECM's default B2 (current version).
+Stage 2 is gpuecm2's batched time per curve at GMP-ECM's default B2 (current version). A
+later measurement at B1 = 11e7 (4224 curves per run of `ecm -gpu2`, numbers of 1037–1226 bits,
+which use the same 1280-bit kernel as RSA-1024) gave 1.34 s per curve, 7% less than the
+linear scaling below, so the scaled times are slight overestimates at large B1.
 
 | N | B1 | GPU stage 1, smallest kernel | GPU stage 1, GMP-ECM 7.0.6 kernel | GPU stage 2 | GPU s2/s1 | CPU s2/s1 |
 |---|---|---|---|---|---|---|

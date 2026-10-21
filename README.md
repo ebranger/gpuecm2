@@ -22,19 +22,21 @@ obtained, where values are average time for one curve in cases several are batch
 | 20 digits | 11e3 | 1 873 422 | 0.1 ms | 20 ms | 0.2 ms | 118× |
 | 25 digits | 5e4 | 12 746 592 | 0.6 ms | 67 ms | 0.4 ms | 152× |
 | 30 digits | 25e4 | 128 992 510 | 3.0 ms | 244 ms | 1.4 ms | 173× |
-| 35 digits | 1e6 | 1 045 563 762 | 13 ms | 1.0 s | 5.6 ms | 184× |
-| 40 digits | 3e6 | 5 706 890 290 | 39 ms | 2.3 s | 12 ms | 184× |
-| 45 digits | 11e6 | 35 133 391 030 | ≈143 ms | 7.4 s | 40 ms | 183× |
+| 35 digits | 1e6 | 1 045 563 762 | 13 ms | 1.03 s | 5.6 ms | 184× |
+| 40 digits | 3e6 | 5 706 890 290 | 39 ms | 2.28 s | 12 ms | 184× |
+| 45 digits | 11e6 | 35 133 391 030 | ≈143 ms | 7.39 s | 40 ms | 183× |
 | 50 digits | 43e6 | 240 490 660 426 | ≈559 ms | 22.2 s | 118 ms | 188× |
-| 55 digits | 11e7 | 776 278 396 540 | ≈1.4 s | 57.0 s | 324 ms | 176× |
-| 60 digits | 26e7 | 3 178 559 884 516 | ≈3.4 s | 118 s | 652 ms | 182× |
-| 65 digits | 85e7 | 15 892 628 251 516 | ≈11.0 s | 290 s | 1.5 s | 189× |
-| 70 digits | 29e8 | 90 975 170 616 348 | ≈37.7 s | 13 min | 4.1 s | 194× |
-| 75 digits | 76e8 | 324 909 696 561 468 | ≈98.8 s | 40 min | 12.2 s | 198× |
-| 80 digits | 25e9 | 1 767 494 382 113 478 | ≈325 s | – | 62.9 s | – |
+| 55 digits | 11e7 | 776 278 396 540 | 1.34 s | 57.0 s | 324 ms | 176× |
+| 60 digits | 26e7 | 3 178 559 884 516 | ≈3.17 s | 118 s | 652 ms | 182× |
+| 65 digits | 85e7 | 15 892 628 251 516 | ≈10.4 s | 290 s | 1.53 s | 189× |
+| 70 digits | 29e8 | 90 975 170 616 348 | ≈35.3 s | 13 min | 4.07 s | 194× |
+| 75 digits | 76e8 | 324 909 696 561 468 | ≈92.6 s | 40 min | 12.2 s | 198× |
+| 80 digits | 25e9 | 1 767 494 382 113 478 | ≈305 s | – | 62.9 s | – |
 
-GPU stage 1 is GMP-ECM 7.0.6's `-gpu` (per curve of a full batch of 4224 curves; values marked
-≈ are extrapolated linearly in B1 from B1 = 3e6, since a full batch at those B1 takes hours);
+GPU stage 1 is GMP-ECM 7.0.6's `-gpu` (per curve of a full batch of 4224 curves). B1 = 11e7
+was measured on numbers of 1037–1226 bits, which use the same 1280-bit CGBN kernel as 1024-bit
+ones; values marked ≈ are extrapolated linearly in B1, from B1 = 3e6 for 11e6 and 43e6 and
+from 11e7 above (a full batch at those B1 takes hours);
 CPU stage 2 is GMP-ECM 7.0.6 on one core (not run at 80 digits); GPU stage 2 is gpuecm2 with
 the curves of a GPU stage 1 run processed together. From B1 = 26e7 on, both programs ran with
 `-maxmem 8000`. Other sizes (512 to 4096 bits, a speedup of 160–240× from B1 = 3e6 on) are
