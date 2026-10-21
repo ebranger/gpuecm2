@@ -8,9 +8,9 @@ For every curve tested, its results agree with GMP-ECM's bit for bit (including 
 internal "Product of G(f_i)" value), and it finds again 1461 stage 2 factors from logs of real
 factoring work.
 
-On an RTX 4070 Ti SUPER a stage 2 at GMP-ECM's default parameters takes 100–200 times less
+On an RTX 4070 Ti SUPER a stage 2 at GMP-ECM's default parameters takes 160–240 times less
 time than GMP-ECM on one core of an i7-14700F, for numbers of 512 to 4096 bits and B1 from
-3e6 up (e.g. 16 ms instead of 2.3 s for a 1024-bit number at B1 = 3e6, 4.0 s instead of 655 s
+3e6 up (e.g. 12 ms instead of 2.3 s for a 1024-bit number at B1 = 3e6, 3.3 s instead of 655 s
 for 4096 bits at B1 = 11e7); see [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 For a 1024-bit number and the B1 values from GMP-ECM's table (with GMP-ECM's
@@ -19,20 +19,26 @@ obtained, where values are average time for one curve in cases several are batch
 
 | Factor size | B1 | B2 (GMP-ECM default) | GPU stage 1 | CPU stage 2 | GPU stage 2 | Stage 2 speedup |
 |---|---|---|---|---|---|---|
-| 35 digits | 1e6 | 1 045 563 762 | 13 ms | 1.0 s | 7.0 ms | 146× |
-| 40 digits | 3e6 | 5 706 890 290 | 39 ms | 2.3 s | 16 ms | 143× |
-| 45 digits | 11e6 | 35 133 391 030 | 143 ms | 7.4 s | 50 ms | 148× |
-| 50 digits | 43e6 | 240 490 660 426 | 559 ms | 22.2 s | 146 ms | 152× |
-| 55 digits | 11e7 | 776 278 396 540 | 1.4 s | 57.0 s | 375 ms | 152× |
-| 60 digits | 26e7 | 3 178 559 884 516 | 3.4 s | 118 s | 763 ms | 155× |
-| 65 digits | 85e7 | 15 892 628 251 516 | 11.0 s | 290 s | 1.8 s | 160× |
-| 70 digits | 29e8 | 90 975 170 616 348 | 37.7 s | 789 s | 4.8 s | 163× |
-| 75 digits | 76e8 | 324 909 696 561 468 | 98.8 s | 2418 s | 14.5 s | 167× |
+| 20 digits | 11e3 | 1 873 422 | 0.1 ms | 20 ms | 0.2 ms | 118× |
+| 25 digits | 5e4 | 12 746 592 | 0.6 ms | 67 ms | 0.4 ms | 152× |
+| 30 digits | 25e4 | 128 992 510 | 3.0 ms | 244 ms | 1.4 ms | 173× |
+| 35 digits | 1e6 | 1 045 563 762 | 13 ms | 1.0 s | 5.6 ms | 184× |
+| 40 digits | 3e6 | 5 706 890 290 | 39 ms | 2.3 s | 12 ms | 184× |
+| 45 digits | 11e6 | 35 133 391 030 | ≈143 ms | 7.4 s | 40 ms | 183× |
+| 50 digits | 43e6 | 240 490 660 426 | ≈559 ms | 22.2 s | 118 ms | 188× |
+| 55 digits | 11e7 | 776 278 396 540 | ≈1.4 s | 57.0 s | 324 ms | 176× |
+| 60 digits | 26e7 | 3 178 559 884 516 | ≈3.4 s | 118 s | 652 ms | 182× |
+| 65 digits | 85e7 | 15 892 628 251 516 | ≈11.0 s | 290 s | 1.5 s | 189× |
+| 70 digits | 29e8 | 90 975 170 616 348 | ≈37.7 s | 13 min | 4.1 s | 194× |
+| 75 digits | 76e8 | 324 909 696 561 468 | ≈98.8 s | 40 min | 12.2 s | 198× |
+| 80 digits | 25e9 | 1 767 494 382 113 478 | ≈325 s | – | 62.9 s | – |
 
-GPU stage 1 is GMP-ECM 7.0.6's `-gpu`; CPU stage 2 is GMP-ECM 7.0.6 on one core; GPU stage 2
-is gpuecm2 with the curves of a GPU stage 1 run processed together. From B1 = 26e7 on, both
-programs ran with `-maxmem 8000`. Other sizes (512 to 4096 bits, the same speedup of 100–200×
-from B1 = 3e6 on) are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+GPU stage 1 is GMP-ECM 7.0.6's `-gpu` (per curve of a full batch of 4224 curves; values marked
+≈ are extrapolated linearly in B1 from B1 = 3e6, since a full batch at those B1 takes hours);
+CPU stage 2 is GMP-ECM 7.0.6 on one core (not run at 80 digits); GPU stage 2 is gpuecm2 with
+the curves of a GPU stage 1 run processed together. From B1 = 26e7 on, both programs ran with
+`-maxmem 8000`. Other sizes (512 to 4096 bits, a speedup of 160–240× from B1 = 3e6 on) are
+in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 gpuecm2 can be used in two ways:
 

@@ -151,6 +151,32 @@ Output is printed in file order once a batch is done; "Step 2 took" is the batch
 by the number of curves. When a curve finds a factor, the curves after it in the batch are
 redone on the cofactor, which is GMP-ECM's behaviour for consecutive lines with the same N.
 
+## Ideas evaluated (October 2026)
+
+Measured or estimated on the RTX 4070 Ti SUPER during the optimisation of the polynomial
+arithmetic; none of them is implemented.
+
+- **All-RNS polynomial arithmetic** (Montgomery reduction in RNS, Kawamura et al. /
+  Bajard–Imbert: the primes split into two bases, two base extensions per reduction instead
+  of RNS → limbs → RNS). A prototype base extension (half the primes to the other half,
+  approximate alpha) takes 0.6–14 ns per coefficient at 512–4608 bits, so one reduction costs
+  1.3–28 ns against 1.4–41 ns for the two conversions it replaces. Counting the conversions of
+  a whole stage 2 (all but the roots' and the final one become reductions), conversion time
+  would drop by 35–48% with the prototype, 55–61% with a base extension as efficient as the
+  limbs → RNS kernel: 7–20% of stage 2 at GMP-ECM's default parameters (most for large N and
+  small B1). Costs: about twice the memory for stored polynomials (P residues instead of nl
+  limbs per coefficient), one or two more primes, and a rewrite of the polynomial layer. A
+  candidate milestone; skipping reductions on some tree levels (more primes instead) could
+  add to it.
+- **NTT lengths 3·2^k** for dF that is not a power of two (above 1920 bits). Full pairs in
+  the product trees always have power-of-two lengths; only the top-level products (products
+  mod F, 1/F, the start of the evaluation, one partial node per level) would be shorter: 1–3%
+  of stage 2 in half of the cases, nothing in the others. Not worth the extra kernels.
+- **The two passes of a four-step NTT on L2-resident data** (transforming groups of rows that
+  fit in the 48 MB L2 one after the other, so that the second pass reads from L2): would save
+  up to one DRAM round trip per transform for T ≥ 2^16; needs a prime offset in the kernels.
+  Not tried; at most 10–20% of the NTT time.
+
 ## Robustness and limits
 
 - Kernels run ≲ 100 ms each, to stay under the Windows TDR and display watchdogs.
