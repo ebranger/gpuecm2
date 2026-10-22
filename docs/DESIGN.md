@@ -86,7 +86,7 @@ The C interface is shaped so that GMP-ECM can call it from its per-curve stage 2
     one tile of sums whatever the size of N. For 33–48 limbs (1025–1536 bits) a variant that
     keeps the column sums of all limbs is faster, below 32 limbs one dot product per thread.
     2.1 ns per coefficient at 1024 bits, 5.8 at 2048, 22 at 4096, 25 at 4608.
-    From 576 limbs (18432 bits) on, two passes: one block per tile of output limbs and
+    From 96 limbs (3072 bits) on, two passes: one block per tile of output limbs and
     group of coefficients (the tile index varying fastest, so that the blocks reading the same
     residues run together), the column sums to a scratch buffer, then one thread per
     coefficient for the carries and the reduction. With one block running over all tiles the
@@ -94,7 +94,12 @@ The C interface is shaped so that GMP-ECM can call it from its per-curve stage 2
     39% at 32768 bits against 91% at 12288), and the one-dimensional grid has few blocks when
     dF is small: the two passes are 25% faster in the conversion itself at 24576-32768 bits
     (1.1 µs instead of 1.46 µs per coefficient at 32768) and up to 44% faster in the whole
-    stage 2 at small dF (32251 bits, B1 = 1e5).
+    stage 2 at small dF (32251 bits, B1 = 1e5). They were first used from 576 limbs, where
+    they are faster for every batch size; below that they win by much less when a batch
+    gives the conversions many coefficients (whole stage 2 with GMP-ECM's parameters and
+    automatic batches: 1.00 at 2560 bits, 1.01 at 3072-4096, 1.02-1.03 at 6144-8192, 0.96
+    at 2048) than with few (polynomial part for one curve and dF = 2048-4096: 1.15 at 4096
+    bits, 1.7 at 8192, 2.1 at 16384), so the threshold is now 96 limbs.
     `bench/bench_conv` measures both directions.
   - Kernels are kept short (tens of ms; Windows' watchdog, a display on the GPU) at large
     sizes: the conversions run in slices of about 2^35 / (P nl) coefficients, the doubling

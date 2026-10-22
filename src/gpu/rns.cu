@@ -807,7 +807,7 @@ __global__ void __launch_bounds__(GB_THREADS) k_to_limbs(const uint32_t *__restr
    2 nl + j) * kn + n]); k_to_limbs_carry then adds them up per coefficient as
    k_to_limbs does. */
 constexpr size_t TS_BYTES = RNS_TO_LIMBS_SCRATCH;  // the most scratch (S) per launch
-constexpr int TS_MIN_NL = 576;  // limbs from which the two passes are faster (18432 bits; equal at 16384)
+constexpr int TS_MIN_NL = 96;  // limbs from which the two passes are faster (3072 bits; equal at 2560)
 template <int TM>
 __global__ void __launch_bounds__(GB_THREADS) k_to_limbs_sums(const uint32_t *__restrict__ X, size_t rows, size_t T,
                                                            size_t lo_i, size_t cnt, size_t K, size_t gbase,
