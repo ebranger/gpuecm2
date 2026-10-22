@@ -3,7 +3,7 @@
    Consecutive residues of the same number are run as one batch. Output per
    residue in the format of `ecm -v -v -resume` (the lines the tests read).
 
-   Usage: capi_resume [-power n | -dickson n] [-k n] [-no-ntt | -ntt] [-selfcheck] [-resume] file B1 [B2]
+   Usage: capi_resume [-power n | -dickson n] [-k n] [-maxmem MB] [-no-ntt | -ntt] [-selfcheck] [-resume] file B1 [B2]
    (-v is accepted and ignored, so that tests/run_hits.py can drive it)
    N must be a decimal number in the file (no expressions); parametrizations
    0-3 with SIGMA, or curves given by A. */
@@ -55,11 +55,13 @@ static int parse(const char *line, residue *r) {
 int main(int argc, char **argv) {
   int S = 0, i, selfcheck = 0, ntt = 1;
   unsigned long k = 0;
+  double maxmem = 0;  /* bytes, as gpuecm2_choose_params takes it (-maxmem: MB, as ecm) */
   const char *file = NULL, *b1 = NULL, *b2 = NULL;
   for (i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "-power") && i + 1 < argc) S = atoi(argv[++i]);
     else if (!strcmp(argv[i], "-dickson") && i + 1 < argc) S = -atoi(argv[++i]);
     else if (!strcmp(argv[i], "-k") && i + 1 < argc) k = strtoul(argv[++i], NULL, 10);
+    else if (!strcmp(argv[i], "-maxmem") && i + 1 < argc) maxmem = atof(argv[++i]) * 1048576.;
     else if (!strcmp(argv[i], "-selfcheck")) selfcheck = 1;
     else if (!strcmp(argv[i], "-resume") && i + 1 < argc) file = argv[++i];  /* as gpuecm2 / ecm */
     else if (!strcmp(argv[i], "-v")) continue;
@@ -109,7 +111,7 @@ int main(int argc, char **argv) {
     gpuecm2_params p;
     gpuecm2_params_init(p);
     gpuecm2_stage2 *s = NULL;
-    if (gpuecm2_choose_params(p, R[at].n, atof(b1), NULL, b2 ? B2 : NULL, k, S, 0, ntt, err, sizeof err) == 0)
+    if (gpuecm2_choose_params(p, R[at].n, atof(b1), NULL, b2 ? B2 : NULL, k, S, maxmem, ntt, err, sizeof err) == 0)
       s = gpuecm2_stage2_new(R[at].n, p, err, sizeof err);
     mpz_t *A = malloc(m * sizeof(mpz_t)), *x = malloc(m * sizeof(mpz_t)), *f = malloc(m * sizeof(mpz_t)),
           *v = malloc(m * sizeof(mpz_t));
