@@ -52,6 +52,9 @@ gpuecm2_params_clear(p);
   while the number and parameters stay the same.
 - `GPUECM2_SELFCHECK` verifies each curve's product trees and final values at random points,
   and a few roots of the first curve of each batch against a CPU computation (5–20% slower).
+- RNS storage of the polynomials (`gpuecm2 -rns`, faster above about 2048 bits, same
+  results) is chosen with the environment variable `GPUECM2_RNS=1` when an engine is made;
+  there is no interface call for it yet.
 - Not thread-safe: call from one thread (one engine per thread and GPU does work, but the
   default CUDA device of each thread must be set with `gpuecm2_set_device`).
 - A CUDA error (e.g. the GPU disappears) terminates the process with a message, as

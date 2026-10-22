@@ -166,6 +166,18 @@ small: GMP-ECM may then find p through a value it cannot invert while setting up
 tests this happened once, with a planted 17-digit prime at B1 = 1e4 (`large_tests.py`
 reports it as a known difference); all other results tested agree exactly.
 
+## RNS storage
+
+`-rns` (or `GPUECM2_RNS=1` in the environment, which every script and the C interface pass
+on) changes how the polynomial arithmetic holds its data, not what it computes, so the whole
+suite applies to it unchanged: `GPUECM2_RNS=1 ctest`, `tests/run_hits.py <gpuecm2> -rns
+-selfcheck` (and with `capi_resume` and the environment variable), the large hits and
+`large_tests.py check`, `boundary_tests.py`. In addition `test_polyalg` runs every case in
+both storages, and `test_stage2` runs batches of random curves through an engine of each
+kind and requires the same products H(-f_i) for every curve (plain, with the self-check,
+with the tree cache, and with the long-product fallback of `GPUECM2_MAX_LOGT=12`), and the
+injected faults to be caught with RNS storage too.
+
 ## Testing aids
 
 Environment variables read by the stage 2 engine (for tests only):
@@ -183,3 +195,4 @@ Environment variables read by the stage 2 engine (for tests only):
 - `GPUECM2_TREE_CACHE_LEVELS=n`: with `-treecache`, keep the transforms of at most n tree
   levels (tests the evaluation's switch between kept and recomputed levels).
 - `GPUECM2_DEBUG=1`: print the root generation plan.
+- `GPUECM2_RNS=1`: RNS storage of the polynomials (as `-rns`; also for the C interface).

@@ -104,6 +104,43 @@ The C interface is shaped so that GMP-ECM can call it from its per-curve stage 2
   - Tried and rejected (M6): the same products as int8 tensor-core GEMMs (bytes of limbs ×
     bytes of constants, exact in int32). With the short inner dimension (4 × limbs) a WMMA
     kernel reached only 13–22 T MAC/s, no faster than the CUDA-core kernels.
+- **RNS storage (option `-rns`, off by default):** the polynomial arrays hold, instead of
+  limbs, residues modulo a second set of the NTT primes, so that the conversions around each
+  product become base extensions between residue systems (`src/gpu/rns.h`, `rns.cu`).
+  - The primes are split into base A (the first P_A) and base B (the other P_B), with
+    M_A > 2^15 L N and M_B > 2^9 N (P_A + P_B is P to P + 2). A coefficient c is stored as
+    the residues mod the primes of B of an integer x ≡ c·M_A (mod N), 0 ≤ x < 64 N
+    (Montgomery form with respect to M_A, redundant): P_B words instead of nl, about 6% more
+    memory per polynomial.
+  - Load (for an NTT): x is extended exactly from B to A as in the limb CRT
+    (x = Σ σ_j M_B/b_j − α M_B, α = ⌊Σ σ_j/b_j + 1/4⌋, exact for x < M_B/4); the residues of B
+    are copied. Store (a product z, an integer below 2·L·(64 N)²): Montgomery reduction
+    r = (z + q N)/M_A with q = −z N⁻¹ mod M_A, extended from A to B approximately and from
+    below (q' = q or q + M_A), so r < z/M_A + 2N < 2.25 N. Both are matrix products of
+    P_A × P_B multiply-adds per coefficient, half of P × nl, with α accumulated in the same
+    tiles.
+  - The polynomial algorithms are unchanged. The constant 1 (the leading coefficients of
+    monic operands, the wrapped term cancelled in the product tree) becomes M_A mod N
+    (`RnsTables::one`); a difference is x + 16N − y, a negation 16N − y (the operands of
+    differences are fresh products, < 4N; the largest stored value, after G − F and the
+    wrapped reduction mod F, is below 24 N). Roots from CGBN are imported (limbs → RNS of
+    all primes, × (M_A² mod N), store) and the evaluated values exported (load,
+    × (M_A⁻¹ mod N), limb CRT), both in place; the self-check reads exported copies. The
+    results are identical to the limb path (tests/test_stage2 compares the products).
+  - Polynomial part, `bench/bench_poly` (dF = 2048-4096, best of 3, limbs/RNS): 1.00× at 1024
+    bits, 1.18× at 2048, 1.72× at 4096, 3.0× at 8192, 3.45× at 16384, 1.74× at 32768; with
+    dF = 8192 1.66-1.85× from 8192 to 32768 bits. At 1024 bits the conversions are limited by
+    memory traffic (each moves about as many words as before), at 8192-16384 bits the limb
+    conversion of a single pass is itself slow, and at 32768 bits half as many row tiles
+    leave the GPU underfilled when there are few coefficients.
+  - Whole stage 2, `bench/bench_stage2` (GMP-ECM's parameters, automatic batch, best of 3,
+    limbs/RNS): 1.07 and 1.05 at 1024 bits (B1 = 1e6, 11e6), 1.08/1.06 at 1536, 1.06/1.04 at
+    2048, 1.17/1.13 at 3072 (1e6, 3e6), 1.24/1.19 at 4096, 1.18 at 6144 (1e6), 1.31/1.30 at
+    8192 (1e5, 1e6). At 8192 bits and B1 = 1e6 the polynomial phases go from 71.5 to 47.6
+    ms per curve, the root generation (29 ms) is unchanged; the conversions are still 2.6
+    times the NTTs.
+  - Tried and rejected: summing two products in 64 bits before each 96-bit addition in the
+    tiles (fewer additions per multiply-add): 4-20% slower in all conversion kernels.
 - **EC arithmetic for roots:** CGBN behind a thin wrapper, sizes in steps of 256 bits up to
   2048, 512 up to 4608, then 1024 up to 8192, 2048 up to 16384 and 4096 up to 32768 (TPI 4
   at 512 bits, 8 up to 1792 and at 3072, 16 up to 8192, 32 above; chosen by measurement up

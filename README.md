@@ -59,7 +59,7 @@ The library has a C interface for other programs as well; see
 
 ```
 gpuecm2 [-v] [-q] [-k n] [-power n | -dickson n] [-maxmem MB] [-no-ntt | -ntt] [-one]
-        [-selfcheck] [-treecache] [-batch n] [-spin] -resume <file> B1 [B2 | B2min-B2max]
+        [-selfcheck] [-treecache] [-rns] [-batch n] [-spin] -resume <file> B1 [B2 | B2min-B2max]
 ```
 
 The options mean what they mean for `ecm` (stage 2 only). In addition:
@@ -75,6 +75,13 @@ The options mean what they mean for `ecm` (stage 2 only). In addition:
   0.4 GB at 512 bits and 0.8 GB at 1024 bits for B1 = 11e7, 1.6 GB at 1024 bits for 26e7
   (`gpuecm2 -h` has a table). It uses at most the memory left free by the rest of stage 2.
   Off by default.
+- `-rns` holds the polynomials as residues modulo a second set of NTT primes instead of
+  limbs, which halves the work of the conversions around each polynomial product
+  ([docs/DESIGN.md](docs/DESIGN.md)). The results are identical; stage 2 gets 4-8% faster
+  up to 2048 bits, 13-24% at 3072-4096 bits and 18-31% at 6144-8192 bits (the polynomial
+  arithmetic alone 1.5-3 times from 8192 bits on; the root generation is unchanged), for
+  about 6% more GPU memory. Off by default; `GPUECM2_RNS=1` in the environment turns it
+  on, also for programs using the C interface.
 - Consecutive residues of the same number (as `ecm -save` and `ecm -gpu -save` write them) are
   processed together on the GPU when one curve alone cannot keep it busy (B1 below about 1e7).
   `-batch n` sets the number of residues per batch (default: automatic; `-batch 1` turns
