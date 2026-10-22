@@ -133,15 +133,13 @@ The C interface is shaped so that GMP-ECM can call it from its per-curve stage 2
     × (M_A⁻¹ mod N), limb CRT), both in place; the self-check reads exported copies. The
     results are identical to the limb path (tests/test_stage2 compares the products).
   - Polynomial part, `bench/bench_poly` (dF = 2048-4096, best of 3, limbs/RNS): 1.00× at 1024
-    bits, 1.18× at 2048, 1.72× at 4096, 3.0× at 8192, 3.45× at 16384, 1.74× at 32768; with
-    dF = 8192 1.66-1.85× from 8192 to 32768 bits. At 1024 bits the conversions are limited by
-    memory traffic (each moves about as many words as before), at 8192-16384 bits the limb
-    conversion of a single pass is itself slow, and at 32768 bits half as many row tiles
-    leave the GPU underfilled when there are few coefficients.
+    bits, 1.30× at 2048, 1.47× at 4096, 1.78× at 8192, 1.67× at 16384, 1.73× at 32768; with
+    dF = 8192 1.55-1.66× from 8192 to 32768 bits. At 1024 bits the conversions are limited by
+    memory traffic (each moves about as many words as before).
   - Whole stage 2, `bench/bench_stage2` (GMP-ECM's parameters, automatic batch, best of 3,
     limbs/RNS): 1.07 and 1.05 at 1024 bits (B1 = 1e6, 11e6), 1.08/1.06 at 1536, 1.06/1.04 at
-    2048, 1.17/1.13 at 3072 (1e6, 3e6), 1.24/1.19 at 4096, 1.18 at 6144 (1e6), 1.31/1.30 at
-    8192 (1e5, 1e6). At 8192 bits and B1 = 1e6 the polynomial phases go from 71.5 to 47.6
+    2048, 1.15/1.12 at 3072 (1e6, 3e6), 1.23/1.17 at 4096, 1.16 at 6144 (1e6), 1.27/1.26 at
+    8192 (1e5, 1e6). At 8192 bits and B1 = 1e6 the polynomial phases go from 68.8 to 47.5
     ms per curve, the root generation (29 ms) is unchanged; the conversions are still 2.6
     times the NTTs.
   - Tried and rejected: summing two products in 64 bits before each 96-bit addition in the
