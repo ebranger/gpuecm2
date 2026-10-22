@@ -31,6 +31,7 @@ bool print_curve = false;  // testing aid: print the Montgomery A computed from 
 bool one = false;          // -one: stop with a number once a factor is found
 bool selfcheck = false;    // -selfcheck: verify the stage 2 arithmetic of every curve
 bool tree_cache = false;   // -treecache: keep the transforms of F's product tree
+bool rns_store = false;    // -rns: RNS storage of the polynomials
 long batch_opt = 0;        // -batch n: curves per GPU run (0: automatic)
 bool spin = false;         // -spin: busy-wait for the GPU
 
@@ -102,7 +103,9 @@ void usage(FILE *f) {
           "                  1024     16 MB  76 MB  166 MB  357 MB  765 MB  1.6 GB\n"
           "                  1536     24 MB 114 MB  247 MB  532 MB  1.1 GB  2.4 GB\n"
           "                at most what is free after the rest of stage 2; no effect\n"
-          "                above 1920 bits\n",
+          "                above 1920 bits\n"
+          "  -rns          hold the polynomials as residues modulo NTT primes instead of\n"
+          "                limbs (same results; faster, slightly more GPU memory)\n",
           (int)GPUECM2_MAX_BITS);
 }
 
@@ -396,6 +399,7 @@ int main(int argc, char **argv) {
     else if (a == "-one") one = true;
     else if (a == "-selfcheck") selfcheck = true;
     else if (a == "-treecache") tree_cache = true;
+    else if (a == "-rns") rns_store = true;
     else if (a == "-batch") {
       if (!parse_long(need("-batch"), 0, 1000000L, &lv)) bad("-batch", "a number of residues, 0 for automatic");
       batch_opt = lv;
@@ -427,6 +431,7 @@ int main(int argc, char **argv) {
   if (!f) { fprintf(stderr, "Could not open file %s for reading\n", resume_file); return 1; }
 
   stage2_cpu_wait(spin);
+  if (rns_store) stage2_set_rns_store(true);
   if (verbose >= 1)
     printf("gpuecm2 %s [GMP %s] [ECM stage 2]\n", gpuecm2_version(), gmp_version);
 

@@ -121,12 +121,32 @@ void stage2_cpu_wait(bool spin) {
   cudaSetDeviceFlags(spin ? cudaDeviceScheduleSpin : cudaDeviceScheduleBlockingSync);
 }
 
+namespace {
+int &rns_store_setting() {
+  static int v = -1;  // -1: not set yet (the environment decides)
+  return v;
+}
+}  // namespace
+void stage2_set_rns_store(bool on) { rns_store_setting() = on; }
+bool stage2_rns_store() {
+  int &v = rns_store_setting();
+  if (v < 0) {
+    const char *e = getenv("GPUECM2_RNS");
+    v = e && atoi(e) != 0;
+  }
+  return v != 0;
+}
+
 /* The peak is reached while G is processed block by block, with the root
    generation of the next block running concurrently. */
 size_t stage2_gpu_bytes(const mpz_t n, const Stage2Params &sp, size_t batch) {
-  const size_t bits = mpz_sizeinbase(n, 2), nl4 = 4 * ((bits + 31) / 32), dF = sp.dF, B = batch;
+  const size_t bits = mpz_sizeinbase(n, 2), dF = sp.dF, B = batch;
   if (dF == 0) return (size_t)256 << 20;
-  const size_t P = (2 * bits + clog2(2 * dF + 2) + 2) / 30 + 2;
+  /* primes (RnsContext::init) and words per coefficient: limbs, or base B (RNS storage) */
+  const bool rs = stage2_rns_store();
+  const size_t lg = clog2(2 * dF + 2), PB = (bits + 10) / 30 + 1;
+  const size_t P = rs ? (bits + lg + 16) / 30 + 1 + PB : (2 * bits + lg + 2) / 30 + 2;
+  const size_t nl4 = 4 * (rs ? PB : (bits + 31) / 32);
   const size_t mem = std::max<size_t>(cgbn_size_for(bits), bits) / 8;  // one CGBN value
   const size_t L = clog2(dF), T2 = (size_t)1 << clog2(2 * dF);
   const size_t a = nl4 * dF, r = 4 * P * T2;  // per curve: a polynomial, a transform of length T2
@@ -146,8 +166,9 @@ size_t stage2_gpu_bytes(const mpz_t n, const Stage2Params &sp, size_t batch) {
   int ndev = 0;
   const size_t cap = cudaGetDeviceCount(&ndev) == cudaSuccess && ndev > 0 ? root_step_capacity(bits) : 16384;
   const size_t waves = 8 * mem * 8 * cap * (S + 1) / std::max<unsigned long>(S, 1);
-  /* the scratch of the conversions (large moduli), and a margin */
-  return per * B + waves + RNS_TO_LIMBS_SCRATCH + ((size_t)256 << 20);
+  /* the scratch of the conversions (large moduli; and the import / export
+     of RNS storage), and a margin */
+  return per * B + waves + RNS_TO_LIMBS_SCRATCH + (rs ? RNS_IMEX_SCRATCH : 0) + ((size_t)256 << 20);
 }
 
 size_t stage2_gpu_budget() {
@@ -214,7 +235,8 @@ Stage2Engine::Stage2Engine(const mpz_t n, const Stage2Params &sp) : sp_(sp) {
   int want_logT = std::max(12, clog2(2 * sp.dF));
   if (const char *e = getenv("GPUECM2_MAX_LOGT"))  // testing aid: shorter NTTs force the long-product paths
     want_logT = std::max(12, std::min(want_logT, atoi(e)));
-  if (!ctx_.init(n, 2 * sp.dF + 2, want_logT, &err_)) return;
+  rns_store_ = stage2_rns_store();
+  if (!ctx_.init(n, 2 * sp.dF + 2, want_logT, &err_, rns_store_)) return;
   /* transient buffers come from the default stream-ordered pool; keep its
      memory between synchronisations instead of returning it to the driver
      (mapping it again for every curve is slow, notably on Windows/WSL) */
@@ -307,6 +329,7 @@ std::vector<Stage2Outcome> Stage2Engine::run_batch(const MontgomeryCurve *Cs, si
   uint32_t *FR = limb_alloc(ctx, N, sr);
   if (r == ROOTS_OK) r = gen.start(*pl.gF);
   if (r == ROOTS_OK) r = gen.next_block(ctx, FR, rfac.get());
+  if (r == ROOTS_OK) ctx.import_limbs(FR, N, N, FR, N, sr);  // (RNS storage; in place)
   lap(tm.rootsF);
   if (r != ROOTS_OK) {
     limb_free(FR, sr);
@@ -342,6 +365,18 @@ std::vector<Stage2Outcome> Stage2Engine::run_batch(const MontgomeryCurve *Cs, si
   };
   std::vector<Check> chk(selfcheck ? B : 0);
   const int nl = ctx.nlimbs();
+  /* the checks read limbs: with RNS storage, the polynomial arrays they read
+     are exported into xbuf[slot] first */
+  uint32_t *xbuf[2] = {nullptr, nullptr};
+  if (!chk.empty() && ctx.rns_store())
+    for (uint32_t *&x : xbuf) x = limb_alloc(ctx, N, sp);
+  auto limbs_of = [&](const uint32_t *A, int slot) -> const uint32_t * {
+    if (!xbuf[slot]) return A;
+    ctx.export_limbs(A, N, N, xbuf[slot], N, sp);
+    return xbuf[slot];
+  };
+  const uint32_t *rootsF = chk.empty() ? nullptr : limbs_of(tree.level[0], 0);
+  const uint32_t *limbsF = chk.empty() ? nullptr : limbs_of(F, 1);
   for (size_t c = 0; c < chk.size(); c++) {
     Check &K = chk[c];
     gmp_randstate_t rs;
@@ -351,7 +386,7 @@ std::vector<Stage2Outcome> Stage2Engine::run_batch(const MontgomeryCurve *Cs, si
     std::vector<uint32_t> w(nl);
     for (int t = 0; t < NCHK; t++) {
       K.idx[t] = (size_t)gmp_urandomm_ui(rs, dF);
-      CUDA_CHECK(cudaMemcpy2DAsync(w.data(), 4, tree.level[0] + c * dF + K.idx[t], N * 4, 4, nl,
+      CUDA_CHECK(cudaMemcpy2DAsync(w.data(), 4, rootsF + c * dF + K.idx[t], N * 4, 4, nl,
                                    cudaMemcpyDeviceToHost, sp));
       CUDA_CHECK(cudaStreamSynchronize(sp));
       mpz_import(K.x[1 + t].get(), nl, -1, 4, 0, 0, w.data());
@@ -371,8 +406,8 @@ std::vector<Stage2Outcome> Stage2Engine::run_batch(const MontgomeryCurve *Cs, si
     Z fr;
     mpz_srcptr rr = K.x[0].get();
     mpz_ptr pr = K.val[0].get();
-    poly_value(ctx, n_.get(), F + c * dF, N, dF, true, K.x[0].get(), fr.get(), sp);
-    roots_value(ctx, n_.get(), tree.level[0] + c * dF, N, dF, &rr, 1, &pr, sp);
+    poly_value(ctx, n_.get(), limbsF + c * dF, N, dF, true, K.x[0].get(), fr.get(), sp);
+    roots_value(ctx, n_.get(), rootsF + c * dF, N, dF, &rr, 1, &pr, sp);
     K.ok &= mpz_cmp(fr.get(), K.val[0].get()) == 0;
   }
   poly_invert(ctx, F, dF, I, sp, B);
@@ -382,7 +417,7 @@ std::vector<Stage2Outcome> Stage2Engine::run_batch(const MontgomeryCurve *Cs, si
   uint32_t *Gb[2] = {limb_alloc(ctx, N, sp), limb_alloc(ctx, N, sp)};
   uint32_t *G = limb_alloc(ctx, N, sp), *H = limb_alloc(ctx, N, sp), *V = limb_alloc(ctx, N, sp);
   auto free_all = [&]() {
-    for (uint32_t *p : {Gb[0], Gb[1], G, H, V, F, I}) limb_free(p, sp);
+    for (uint32_t *p : {Gb[0], Gb[1], G, H, V, F, I, xbuf[0], xbuf[1]}) limb_free(p, sp);
     tree_free(tree, sp);
   };
   after(sr, sp, ev_[3]);  // the allocations above
@@ -411,15 +446,18 @@ std::vector<Stage2Outcome> Stage2Engine::run_batch(const MontgomeryCurve *Cs, si
         if (plan_argument(pl.G, false, sp_, b * dF + i, v) && cpu_root(Cs[0], sp_.S, v, cg))
           chk[0].ok &= mpz_cmp(gv, cg) == 0;
       }
+      ctx.import_limbs(Gb[b % 2], N, N, Gb[b % 2], N, sp);  // (RNS storage; in place)
       tree_build(ctx, Gb[b % 2], dF, G, nullptr, sp, B);
+      const uint32_t *rootsG = chk.empty() ? nullptr : limbs_of(Gb[b % 2], 0);
+      const uint32_t *limbsG = chk.empty() ? nullptr : limbs_of(G, 1);
       for (size_t c = 0; c < chk.size(); c++) {  // G(r) = prod (r + g_j); accumulate prod (g_j - f_i)
         Check &K = chk[c];
         mpz_srcptr xs[1 + NCHK];
         mpz_ptr vs[1 + NCHK];
         for (int t = 0; t <= NCHK; t++) { xs[t] = K.x[t].get(); vs[t] = K.val[t].get(); }
-        roots_value(ctx, n_.get(), Gb[b % 2] + c * dF, N, dF, xs, 1 + NCHK, vs, sp);
+        roots_value(ctx, n_.get(), rootsG + c * dF, N, dF, xs, 1 + NCHK, vs, sp);
         Z gr;
-        poly_value(ctx, n_.get(), G + c * dF, N, dF, true, K.x[0].get(), gr.get(), sp);
+        poly_value(ctx, n_.get(), limbsG + c * dF, N, dF, true, K.x[0].get(), gr.get(), sp);
         K.ok &= mpz_cmp(gr.get(), K.val[0].get()) == 0;
         for (int t = 0; t < NCHK; t++) {
           mpz_mul(K.acc[t].get(), K.acc[t].get(), K.val[1 + t].get());
@@ -450,6 +488,7 @@ std::vector<Stage2Outcome> Stage2Engine::run_batch(const MontgomeryCurve *Cs, si
     }
   }
   poly_eval_tree(ctx, tree, I, H, V, sp);
+  ctx.export_limbs(V, N, N, V, N, sp);  // (RNS storage; in place)
   lap(tm.eval);
   /* first values (GMP-ECM's "Product of G(f_i)" debug line) and the products */
   {

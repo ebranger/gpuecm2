@@ -118,18 +118,21 @@ struct PreMul {
 };
 
 /* The input of the first pass of a forward transform: positions outside
-   [lo, lo + len) of each row are 0, except lead which is lead_c; they are
-   not read. len == SIZE_MAX: all positions are read. */
+   [lo, lo + len) of each row are 0, except lead which is lead_c (times the
+   stored representation of 1, RnsTables::one); they are not read.
+   len == SIZE_MAX: all positions are read. */
 struct Pad {
   size_t lo = 0, len = SIZE_MAX;
   long lead = -1;
   int lead_c = 0;
 };
 
-__device__ __forceinline__ uint32_t pad_load(const Pad &pd, const uint32_t *x, size_t pos, uint32_t p) {
+__device__ __forceinline__ uint32_t pad_load(const Pad &pd, const uint32_t *x, size_t pos, uint32_t p,
+                                             const RnsTables &t, int q) {
   if (pos - pd.lo < pd.len) return *x;  // unsigned: pos >= lo && pos < lo + len
   if ((long)pos != pd.lead) return 0;
-  return pd.lead_c >= 0 ? (uint32_t)pd.lead_c % p : p - (uint32_t)(-pd.lead_c) % p;
+  const uint32_t c = pd.lead_c >= 0 ? (uint32_t)pd.lead_c % p : p - (uint32_t)(-pd.lead_c) % p;
+  return (uint32_t)reduce64((uint64_t)c * t.one[q], p, t.mu[q]);
 }
 
 __device__ __forceinline__ uint32_t premul_load(const PreMul &pm, int q, size_t row, int logM, int i, uint32_t p,
@@ -224,7 +227,7 @@ __global__ void __launch_bounds__(NTT_THREADS) kRow(uint32_t *__restrict__ X, si
       load8(g + idx[0], v);
     } else if (!INV && pd.len != SIZE_MAX) {
 #pragma unroll
-      for (int i = 0; i < 8; i++) v[i] = pad_load(pd, g + idx[i], (size_t)idx[i], p);
+      for (int i = 0; i < 8; i++) v[i] = pad_load(pd, g + idx[i], (size_t)idx[i], p, t, q);
     } else {
 #pragma unroll
       for (int i = 0; i < 8; i++) v[i] = g[idx[i]];
@@ -287,7 +290,7 @@ __global__ void __launch_bounds__(NTT_THREADS) kCol(uint32_t *__restrict__ X, si
   get_index_set(idx, r, qq, sb);
   if (!INV && pd.len != SIZE_MAX) {
 #pragma unroll
-    for (int i = 0; i < 8; i++) v[i] = pad_load(pd, g + (size_t)idx[i] * C, (size_t)idx[i] * C + l, p);
+    for (int i = 0; i < 8; i++) v[i] = pad_load(pd, g + (size_t)idx[i] * C, (size_t)idx[i] * C + l, p, t, q);
   } else {
 #pragma unroll
     for (int i = 0; i < 8; i++) v[i] = g[(size_t)idx[i] * C];

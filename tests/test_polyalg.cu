@@ -1,5 +1,6 @@
 /* M3 tests: product tree, series inversion, reduction mod F and the
-   transposed multipoint evaluation, checked against GMP. */
+   transposed multipoint evaluation, checked against GMP; with limbs and with
+   RNS storage (the arrays imported from / exported to limbs). */
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -16,13 +17,15 @@
 
 static int failures = 0;
 static gmp_randstate_t rs;
+static bool rns_store = false;  // the mode of the current run
 
-struct Vec {  // n residues, host copy + device limb array (ld = n)
+struct Vec {  // n residues, host copy + device array (ld = n) of the context's representation
   const RnsContext &ctx;
   size_t n;
   std::vector<Z> v;
   uint32_t *d = nullptr;
-  Vec(const RnsContext &c, size_t n_) : ctx(c), n(n_), v(n_) { CUDA_CHECK(cudaMalloc(&d, (size_t)c.nlimbs() * (n ? n : 1) * 4)); }
+  Vec(const RnsContext &c, size_t n_) : ctx(c), n(n_), v(n_) { CUDA_CHECK(cudaMalloc(&d, words() * 4)); }
+  size_t words() const { return (size_t)ctx.coef_words() * (n ? n : 1); }
   ~Vec() { cudaFree(d); }
   void random(const mpz_t N) { for (auto &x : v) mpz_urandomm(x.get(), rs, N); upload(); }
   void upload() {
@@ -35,12 +38,17 @@ struct Vec {  // n residues, host copy + device limb array (ld = n)
       for (int j = 0; j < nl; j++) h[(size_t)j * n + g] = tmp[j];
     }
     CUDA_CHECK(cudaMemcpy(d, h.data(), h.size() * 4, cudaMemcpyHostToDevice));
+    ctx.import_limbs(d, n, n, d, n);  // in place (coef_words() >= nlimbs())
   }
   void download() {
-    CUDA_CHECK(cudaDeviceSynchronize());
     const int nl = ctx.nlimbs();
     std::vector<uint32_t> h((size_t)nl * n), tmp(nl);
-    CUDA_CHECK(cudaMemcpy(h.data(), d, h.size() * 4, cudaMemcpyDeviceToHost));
+    uint32_t *e;
+    CUDA_CHECK(cudaMalloc(&e, words() * 4));
+    ctx.export_limbs(d, n, n, e, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h.data(), e, h.size() * 4, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(e));
     for (size_t g = 0; g < n; g++) {
       for (int j = 0; j < nl; j++) tmp[j] = h[(size_t)j * n + g];
       mpz_import(v[g].get(), nl, -1, 4, 0, 0, tmp.data());
@@ -83,7 +91,8 @@ static std::vector<size_t> sample(size_t n, bool full) {
 }
 
 static void report(bool ok, const char *what, int bits, size_t n, int logTmax, const char *extra = "") {
-  printf("%s %-9s %4d bits, n=%-7zu Tmax=2^%d%s\n", ok ? "ok  " : "FAIL", what, bits, n, logTmax, extra);
+  printf("%s %-9s %4d bits, n=%-7zu Tmax=2^%d%s%s\n", ok ? "ok  " : "FAIL", what, bits, n, logTmax, extra,
+         rns_store ? " [rns]" : "");
   failures += !ok;
 }
 
@@ -92,7 +101,7 @@ static void run(int bits, size_t n, int want_logT) {
   mpz_urandomb(N.get(), rs, bits); mpz_setbit(N.get(), bits - 1); mpz_setbit(N.get(), 0);
   RnsContext ctx;
   std::string err;
-  if (!ctx.init(N.get(), 2 * n + 2, want_logT, &err)) { printf("FAIL init: %s\n", err.c_str()); failures++; return; }
+  if (!ctx.init(N.get(), 2 * n + 2, want_logT, &err, rns_store)) { printf("FAIL init: %s\n", err.c_str()); failures++; return; }
   const bool full = n <= 1500, fb = n * 2 > ((size_t)1 << ctx.logTmax());
   const char *tag = fb ? " [fallback products]" : "";
   const int lt = ctx.logTmax();
@@ -109,7 +118,7 @@ static void run(int bits, size_t n, int want_logT) {
     /* every tree node */
     for (int l = 0; l < tree.L && ok; l++) {
       Vec lev(ctx, n);
-      CUDA_CHECK(cudaMemcpy(lev.d, tree.level[l], (size_t)ctx.nlimbs() * n * 4, cudaMemcpyDeviceToDevice));
+      CUDA_CHECK(cudaMemcpy(lev.d, tree.level[l], lev.words() * 4, cudaMemcpyDeviceToDevice));
       lev.download();
       const size_t m = (size_t)1 << l;
       for (size_t j = 0; j * m < n && ok; j++) {
@@ -151,7 +160,7 @@ static void run(int bits, size_t n, int want_logT) {
   Vec G(ctx, n), H(ctx, n), H2(ctx, n);
   G.random(N.get());
   H.random(N.get());
-  CUDA_CHECK(cudaMemcpy(H2.d, H.d, (size_t)ctx.nlimbs() * n * 4, cudaMemcpyDeviceToDevice));
+  CUDA_CHECK(cudaMemcpy(H2.d, H.d, H2.words() * 4, cudaMemcpyDeviceToDevice));
   {
     MulModF mm(ctx, F.d, I.d, n);
     mm.mulmod(G.d, H2.d);
@@ -205,33 +214,43 @@ static void run(int bits, size_t n, int want_logT) {
 }
 
 int main(int argc, char **argv) {
-  bool quick = argc > 1 && strcmp(argv[1], "--quick") == 0;
-  gmp_randinit_default(rs);
-  gmp_randseed_ui(rs, 77);
-  if (argc == 5 && strcmp(argv[1], "--case") == 0) {  // --case bits n want_logT
-    run(atoi(argv[2]), (size_t)atol(argv[3]), atoi(argv[4]));
-    printf("%s (%d failures)\n", failures ? "FAIL" : "OK", failures);
-    return failures != 0;
+  /* [--quick] [--limbs | --rns] [--case bits n want_logT]; both modes by default */
+  bool quick = false, modes[2] = {true, true};
+  int a = 1;
+  for (; a < argc && argv[a][0] == '-' && strcmp(argv[a], "--case"); a++) {
+    if (!strcmp(argv[a], "--quick")) quick = true;
+    else if (!strcmp(argv[a], "--limbs")) modes[1] = false;
+    else if (!strcmp(argv[a], "--rns")) modes[0] = false;
   }
-  for (size_t n : {1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 33, 64, 100, 255, 257})
-    run(1024, n, 20);
-  run(64, 100, 20);
-  run(2048, 77, 20);
-  run(4400, 50, 20);
-  run(16000, 100, 20);
-  run(32768, 40, 20);
-  run(1024, 1000, 20);
-  run(1024, 3000, 12);  // fallback products (Tmax = 4096)
-  run(2048, 2500, 12);
-  if (!quick) {
-    run(1024, 1500, 20);
-    run(1024, 5000, 12);
-    run(1024, 4096, 20);
-    run(1024, 65536, 20);
-    run(2048, 36864, 20);   // GMP-ECM's dF for 2048-bit N, B1 = 11e6
-    run(4400, 5000, 20);
-    run(32768, 3000, 20);
-    run(1024, 131072, 20);
+  gmp_randinit_default(rs);
+  for (int m = 0; m < 2; m++) {
+    if (!modes[m]) continue;
+    rns_store = m == 1;
+    gmp_randseed_ui(rs, 77);
+    if (a + 4 == argc && strcmp(argv[a], "--case") == 0) {  // --case bits n want_logT
+      run(atoi(argv[a + 1]), (size_t)atol(argv[a + 2]), atoi(argv[a + 3]));
+      continue;
+    }
+    for (size_t n : {1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 33, 64, 100, 255, 257})
+      run(1024, n, 20);
+    run(64, 100, 20);
+    run(2048, 77, 20);
+    run(4400, 50, 20);
+    run(16000, 100, 20);
+    run(32768, 40, 20);
+    run(1024, 1000, 20);
+    run(1024, 3000, 12);  // fallback products (Tmax = 4096)
+    run(2048, 2500, 12);
+    if (!quick) {
+      run(1024, 1500, 20);
+      run(1024, 5000, 12);
+      run(1024, 4096, 20);
+      run(1024, 65536, 20);
+      run(2048, 36864, 20);   // GMP-ECM's dF for 2048-bit N, B1 = 11e6
+      run(4400, 5000, 20);
+      run(32768, 3000, 20);
+      run(1024, 131072, 20);
+    }
   }
   printf("%s (%d failures)\n", failures ? "FAIL" : "OK", failures);
   return failures != 0;

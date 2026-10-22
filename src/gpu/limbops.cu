@@ -3,6 +3,7 @@
    License, version 3 or later. See COPYING.LESSER and COPYING. */
 #include "gpu/limbops.h"
 
+#include "gpu/arith32.cuh"
 #include "gpu/cuda_check.h"
 
 namespace {
@@ -68,6 +69,32 @@ __global__ void k_addsub(const uint32_t *__restrict__ A, size_t lda, size_t as, 
   }
 }
 
+/* the same with RNS storage: residues mod b_j = p[PA + j] of integers < 64 n,
+   a difference is x + (16 n - y) (exact for y <= 16 n) */
+template <int OP>
+__global__ void k_addsub_rns(const uint32_t *__restrict__ A, size_t lda, size_t as, const uint32_t *__restrict__ B,
+                             size_t ldb, size_t bs, uint32_t *C, size_t ldc, size_t cs, size_t cnt, size_t count,
+                             RnsTables t) {
+  for (size_t e = (size_t)blockIdx.x * blockDim.x + threadIdx.x; e < count; e += (size_t)gridDim.x * blockDim.x) {
+    const size_t ia = at(e, cnt, as), ib = OP == 2 ? 0 : at(e, cnt, bs), ic = at(e, cnt, cs);
+    for (int j = 0; j < t.PB; j++) {
+      const uint32_t p = t.p[t.PA + j], a = A[j * lda + ia];
+      uint32_t r;
+      if (OP == 0) r = add_mod(a, B[j * ldb + ib], p);
+      else if (OP == 1) r = add_mod(a, sub_mod(t.n16B[j], B[j * ldb + ib], p), p);
+      else r = sub_mod(t.n16B[j], a, p);
+      C[j * ldc + ic] = r;
+    }
+  }
+}
+
+/* word j of the constant c: c (j = 0) and 0, or c * one mod b_j (RNS storage) */
+__device__ __forceinline__ uint32_t const_word(uint32_t c, int j, const RnsTables &t) {
+  if (!t.PB) return j == 0 ? c : 0;
+  const int q = t.PA + j;
+  return (uint32_t)reduce64((uint64_t)c * t.one[q], t.p[q], t.mu[q]);
+}
+
 __global__ void k_copy(const uint32_t *__restrict__ A, size_t lda, size_t as, uint32_t *__restrict__ C, size_t ldc,
                        size_t cs, size_t cnt, size_t count, bool rev, int nl) {
   for (size_t e = (size_t)blockIdx.x * blockDim.x + threadIdx.x; e < count; e += (size_t)gridDim.x * blockDim.x) {
@@ -77,21 +104,22 @@ __global__ void k_copy(const uint32_t *__restrict__ A, size_t lda, size_t as, ui
   }
 }
 
-__global__ void k_set_ui(uint32_t *C, size_t ldc, size_t cs, size_t cnt, size_t count, uint32_t c, int nl) {
+__global__ void k_set_ui(uint32_t *C, size_t ldc, size_t cs, size_t cnt, size_t count, uint32_t c, RnsTables t) {
   for (size_t e = (size_t)blockIdx.x * blockDim.x + threadIdx.x; e < count; e += (size_t)gridDim.x * blockDim.x) {
     const size_t dst = at(e, cnt, cs);
-    for (int j = 0; j < nl; j++) C[j * ldc + dst] = j == 0 ? c : 0;
+    for (int j = 0; j < t.cw; j++) C[j * ldc + dst] = const_word(c, j, t);
   }
 }
 
 __global__ void k_gather(const uint32_t *__restrict__ A, size_t lda, size_t row_stride, size_t data_len, bool rev,
                          size_t offset, long lead_pos, size_t rows, size_t len, uint32_t *__restrict__ Out, size_t ldo,
-                         int nl) {
+                         RnsTables tb) {
+  const int nl = tb.cw;
   const size_t total = rows * len;
   for (size_t g = (size_t)blockIdx.x * blockDim.x + threadIdx.x; g < total; g += (size_t)gridDim.x * blockDim.x) {
     const size_t r = g / len, t = g % len;
     if ((long)t == lead_pos) {
-      for (int j = 0; j < nl; j++) Out[j * ldo + g] = j == 0;
+      for (int j = 0; j < nl; j++) Out[j * ldo + g] = const_word(1, j, tb);
     } else if (t >= offset && t < offset + data_len) {
       const size_t d = rev ? offset + data_len - 1 - t : t - offset;
       const size_t src = r * row_stride + d;
@@ -116,7 +144,7 @@ __global__ void k_scatter(const uint32_t *__restrict__ Src, size_t lds, size_t r
 void limb_scatter_rows(const RnsContext &ctx, const uint32_t *Src, size_t lds, size_t rows, size_t cnt, uint32_t *Dst,
                        size_t ldd, size_t dst_stride, size_t dst_off, cudaStream_t s) {
   if (!rows || !cnt) return;
-  k_scatter<<<blocks(rows * cnt), 128, 0, s>>>(Src, lds, rows, cnt, Dst, ldd, dst_stride, dst_off, ctx.nlimbs());
+  k_scatter<<<blocks(rows * cnt), 128, 0, s>>>(Src, lds, rows, cnt, Dst, ldd, dst_stride, dst_off, ctx.coef_words());
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -125,39 +153,51 @@ void limb_gather_rows(const RnsContext &ctx, const uint32_t *A, size_t lda, size
                       cudaStream_t s) {
   if (!rows || !len) return;
   k_gather<<<blocks(rows * len), 128, 0, s>>>(A, lda, row_stride, data_len, reverse, offset, lead_pos, rows, len, Out,
-                                             ldo, ctx.nlimbs());
+                                             ldo, ctx.tables());
   CUDA_CHECK(cudaGetLastError());
 }
 
 void limb_add_rows(const RnsContext &ctx, const uint32_t *A, size_t lda, size_t as, const uint32_t *B, size_t ldb,
                    size_t bs, uint32_t *C, size_t ldc, size_t cs, size_t rows, size_t cnt, cudaStream_t s) {
   if (!rows || !cnt) return;
-  k_addsub<0><<<blocks(rows * cnt), 128, 0, s>>>(A, lda, as, B, ldb, bs, C, ldc, cs, cnt, rows * cnt, ctx.tables());
+  if (ctx.rns_store())
+    k_addsub_rns<0><<<blocks(rows * cnt), 128, 0, s>>>(A, lda, as, B, ldb, bs, C, ldc, cs, cnt, rows * cnt,
+                                                     ctx.tables());
+  else
+    k_addsub<0><<<blocks(rows * cnt), 128, 0, s>>>(A, lda, as, B, ldb, bs, C, ldc, cs, cnt, rows * cnt, ctx.tables());
   CUDA_CHECK(cudaGetLastError());
 }
 void limb_sub_rows(const RnsContext &ctx, const uint32_t *A, size_t lda, size_t as, const uint32_t *B, size_t ldb,
                    size_t bs, uint32_t *C, size_t ldc, size_t cs, size_t rows, size_t cnt, cudaStream_t s) {
   if (!rows || !cnt) return;
-  k_addsub<1><<<blocks(rows * cnt), 128, 0, s>>>(A, lda, as, B, ldb, bs, C, ldc, cs, cnt, rows * cnt, ctx.tables());
+  if (ctx.rns_store())
+    k_addsub_rns<1><<<blocks(rows * cnt), 128, 0, s>>>(A, lda, as, B, ldb, bs, C, ldc, cs, cnt, rows * cnt,
+                                                     ctx.tables());
+  else
+    k_addsub<1><<<blocks(rows * cnt), 128, 0, s>>>(A, lda, as, B, ldb, bs, C, ldc, cs, cnt, rows * cnt, ctx.tables());
   CUDA_CHECK(cudaGetLastError());
 }
 void limb_neg_rows(const RnsContext &ctx, const uint32_t *A, size_t lda, size_t as, uint32_t *C, size_t ldc, size_t cs,
                    size_t rows, size_t cnt, cudaStream_t s) {
   if (!rows || !cnt) return;
-  k_addsub<2><<<blocks(rows * cnt), 128, 0, s>>>(A, lda, as, nullptr, 0, 0, C, ldc, cs, cnt, rows * cnt,
-                                                 ctx.tables());
+  if (ctx.rns_store())
+    k_addsub_rns<2><<<blocks(rows * cnt), 128, 0, s>>>(A, lda, as, nullptr, 0, 0, C, ldc, cs, cnt, rows * cnt,
+                                                     ctx.tables());
+  else
+    k_addsub<2><<<blocks(rows * cnt), 128, 0, s>>>(A, lda, as, nullptr, 0, 0, C, ldc, cs, cnt, rows * cnt,
+                                                   ctx.tables());
   CUDA_CHECK(cudaGetLastError());
 }
 void limb_copy_rows(const RnsContext &ctx, const uint32_t *A, size_t lda, size_t as, uint32_t *C, size_t ldc,
                     size_t cs, size_t rows, size_t cnt, bool rev, cudaStream_t s) {
   if (!rows || !cnt) return;
-  k_copy<<<blocks(rows * cnt), 128, 0, s>>>(A, lda, as, C, ldc, cs, cnt, rows * cnt, rev, ctx.nlimbs());
+  k_copy<<<blocks(rows * cnt), 128, 0, s>>>(A, lda, as, C, ldc, cs, cnt, rows * cnt, rev, ctx.coef_words());
   CUDA_CHECK(cudaGetLastError());
 }
 void limb_set_ui_rows(const RnsContext &ctx, uint32_t *C, size_t ldc, size_t cs, size_t rows, size_t cnt, uint32_t c,
                       cudaStream_t s) {
   if (!rows || !cnt) return;
-  k_set_ui<<<blocks(rows * cnt), 128, 0, s>>>(C, ldc, cs, cnt, rows * cnt, c, ctx.nlimbs());
+  k_set_ui<<<blocks(rows * cnt), 128, 0, s>>>(C, ldc, cs, cnt, rows * cnt, c, ctx.tables());
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -183,7 +223,7 @@ void limb_set_ui(const RnsContext &ctx, uint32_t *C, size_t ldc, size_t count, u
 
 uint32_t *limb_alloc(const RnsContext &ctx, size_t count, cudaStream_t s) {
   uint32_t *p = nullptr;
-  CUDA_CHECK(cudaMallocAsync(&p, (size_t)ctx.nlimbs() * (count ? count : 1) * 4, s));
+  CUDA_CHECK(cudaMallocAsync(&p, (size_t)ctx.coef_words() * (count ? count : 1) * 4, s));
   return p;
 }
 void limb_free(uint32_t *p, cudaStream_t s) {

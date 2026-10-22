@@ -64,28 +64,47 @@ RnsContext::~RnsContext() {
   for (void *p : allocs_) cudaFree(p);
 }
 
-bool RnsContext::init(const mpz_t n, size_t max_operand_len, int want_logT, std::string *err) {
+bool RnsContext::init(const mpz_t n, size_t max_operand_len, int want_logT, std::string *err, bool rns_store) {
   const int nbits = (int)mpz_sizeinbase(n, 2);
   const int nl = (nbits + 31) / 32;
   int lglen = 0;
   while (((size_t)1 << lglen) < max_operand_len) lglen++;
-  /* exact CRT needs M > 2 * max_operand_len * n^2 */
+  /* limbs: exact CRT needs M > 2 * max_operand_len * n^2. RNS storage: the
+     operands of a product are < 64 n, so a product coefficient (with a wrap,
+     twice the convolution) is z < 2 L 64^2 n^2 (L = max_operand_len); the
+     reduction r = (z + q n) / M_A with q < 2 M_A is < 4 n if M_A > L 64^2 n,
+     and the stored x < 64 n are recovered from base B by the exact extension
+     if x < M_B / 4: M_A > L 2^12 n (with margin), M_B > 2^8 n. */
   const int need_bits = 2 * nbits + lglen + 2;
+  const int a_bits = nbits + lglen + 16, b_bits = nbits + 10;
 
-  Z M;
-  int k;
+  Z M, MA, MB;
+  int k, PA = 0;
   for (k = want_logT; k >= 12; k--) {
     primes_.clear();
     mpz_set_ui(M, 1);
-    for (uint64_t c = ((1ULL << 31) - 1) >> k; c >= 1; c--) {
+    mpz_set_ui(MA, 1);
+    mpz_set_ui(MB, 1);
+    PA = 0;
+    bool done = false;
+    for (uint64_t c = ((1ULL << 31) - 1) >> k; c >= 1 && !done; c--) {
       uint64_t p = (c << k) + 1;
       if (p < (1ULL << 28)) break;
       if (!is_prime32(p)) continue;
+      if (rns_store && mpz_fdiv_ui(n, (unsigned long)p) == 0) continue;  // (n coprime to the primes)
       primes_.push_back((uint32_t)p);
       mpz_mul_ui(M, M, (unsigned long)p);
-      if ((int)mpz_sizeinbase(M, 2) >= need_bits) break;
+      if (!rns_store) {
+        done = (int)mpz_sizeinbase(M, 2) >= need_bits;
+      } else if ((int)mpz_sizeinbase(MA, 2) < a_bits) {  // base A first, then B
+        mpz_mul_ui(MA, MA, (unsigned long)p);
+        PA++;
+      } else {
+        mpz_mul_ui(MB, MB, (unsigned long)p);
+        done = (int)mpz_sizeinbase(MB, 2) >= b_bits;
+      }
     }
-    if ((int)mpz_sizeinbase(M, 2) >= need_bits) break;
+    if (done) break;
   }
   if (k < 12) {
     *err = "not enough NTT primes for a modulus of this size";
@@ -94,6 +113,9 @@ bool RnsContext::init(const mpz_t n, size_t max_operand_len, int want_logT, std:
   const int P = (int)primes_.size();
   const size_t Tmax = (size_t)1 << k;
   t_.P = P; t_.nlimbs = nl; t_.logTmax = k;
+  t_.PA = rns_store ? PA : 0;
+  t_.PB = rns_store ? P - PA : 0;
+  t_.cw = rns_store ? P - PA : nl;
 
   std::vector<uint32_t> pinv(P), k32(P), k64(P), v(P), rinv(P), pow32((size_t)P * nl), Mi((size_t)P * nl);
   std::vector<uint64_t> mu(P);
@@ -165,6 +187,78 @@ bool RnsContext::init(const mpz_t n, size_t max_operand_len, int want_logT, std:
   t_.ntop = (double)nl_n[nl - 1] + (nl >= 2 ? (double)nl_n[nl - 2] / 4294967296.0 : 0.0) +
             (nl >= 3 ? (double)nl_n[nl - 3] / 18446744073709551616.0 : 0.0);
 
+  /* the constant 1 in RNS arrays, and the RNS storage tables */
+  std::vector<uint32_t> one(P, 1);
+  if (rns_store) {
+    const int PB = P - PA;
+    Z ma_n, ma2_n, mainv_n, t2;
+    mpz_mod(ma_n, MA, n);
+    mpz_mul(ma2_n, ma_n, ma_n);
+    mpz_mod(ma2_n, ma2_n, n);
+    if (!mpz_invert(mainv_n, MA, n)) {
+      *err = "modulus not coprime to the RNS primes";
+      return false;
+    }
+    std::vector<uint32_t> cimp(P), cexp(P), eBA((size_t)PA * PB), ibB(PB), ibBp(PB), mBA(PA), eAB((size_t)PB * PA);
+    std::vector<uint32_t> sA((size_t)(k + 1) * 2 * PA), sAp(sA.size()), sB((size_t)(k + 1) * 2 * PB), sBp(sB.size());
+    std::vector<uint32_t> mAB(PB), nB(PB), n16B(PB), iAB(PB), iABp(PB);
+    for (int q = 0; q < P; q++) {
+      const unsigned long p = primes_[q];
+      one[q] = (uint32_t)mpz_fdiv_ui(ma_n, p);
+      rinv[q] = (uint32_t)((uint64_t)rinv[q] * one[q] % p * one[q] % p);  // the wrapped lead is one^2
+      cimp[q] = (uint32_t)mpz_fdiv_ui(ma2_n, p);
+      cexp[q] = (uint32_t)mpz_fdiv_ui(mainv_n, p);
+    }
+    auto scale = [&](uint64_t p, int lt, int m) {  // 2^(32 m) / 2^lt mod p, as in the CRT constants
+      uint64_t c = powmod64(powmod64(2, lt, p), p - 2, p);
+      return m ? (c << 32) % p : c;
+    };
+    for (int i = 0; i < PA; i++) {
+      const uint64_t a = primes_[i];
+      mBA[i] = (uint32_t)mpz_fdiv_ui(MB, (unsigned long)a);
+      for (int j = 0; j < PB; j++) {
+        mpz_divexact_ui(t2, MB, (unsigned long)primes_[PA + j]);
+        eBA[(size_t)i * PB + j] = (uint32_t)mpz_fdiv_ui(t2, (unsigned long)a);
+      }
+      mpz_divexact_ui(t2, MA, (unsigned long)a);
+      const uint64_t ia = powmod64(mpz_fdiv_ui(t2, (unsigned long)a), a - 2, a);       // (M_A/a)^-1 mod a
+      const uint64_t ni = (a - powmod64(mpz_fdiv_ui(n, (unsigned long)a), a - 2, a)) % a;  // -n^-1 mod a
+      for (int lt = 0; lt <= k; lt++)
+        for (int m = 0; m < 2; m++) {
+          const uint64_t c = scale(a, lt, m) * ni % a * ia % a;
+          const size_t idx = ((size_t)lt * 2 + m) * PA + i;
+          sA[idx] = (uint32_t)c;
+          sAp[idx] = shoup((uint32_t)c, (uint32_t)a);
+        }
+    }
+    for (int j = 0; j < PB; j++) {
+      const uint64_t b = primes_[PA + j];
+      mpz_divexact_ui(t2, MB, (unsigned long)b);
+      ibB[j] = (uint32_t)powmod64(mpz_fdiv_ui(t2, (unsigned long)b), b - 2, b);
+      ibBp[j] = shoup(ibB[j], (uint32_t)b);
+      for (int i = 0; i < PA; i++) {
+        mpz_divexact_ui(t2, MA, (unsigned long)primes_[i]);
+        eAB[(size_t)j * PA + i] = (uint32_t)mpz_fdiv_ui(t2, (unsigned long)b);
+      }
+      mAB[j] = (uint32_t)mpz_fdiv_ui(MA, (unsigned long)b);
+      nB[j] = (uint32_t)mpz_fdiv_ui(n, (unsigned long)b);
+      n16B[j] = (uint32_t)((uint64_t)nB[j] * 16 % b);
+      iAB[j] = (uint32_t)powmod64(mAB[j], b - 2, b);
+      iABp[j] = shoup(iAB[j], (uint32_t)b);
+      for (int lt = 0; lt <= k; lt++)
+        for (int m = 0; m < 2; m++) {
+          const uint64_t c = scale(b, lt, m);
+          const size_t idx = ((size_t)lt * 2 + m) * PB + j;
+          sB[idx] = (uint32_t)c;
+          sBp[idx] = shoup((uint32_t)c, (uint32_t)b);
+        }
+    }
+    t_.eBA = upload(eBA); t_.ibB = upload(ibB); t_.ibBp = upload(ibBp); t_.mBA = upload(mBA);
+    t_.eAB = upload(eAB); t_.sA = upload(sA); t_.sAp = upload(sAp); t_.sB = upload(sB); t_.sBp = upload(sBp);
+    t_.mAB = upload(mAB); t_.nB = upload(nB); t_.n16B = upload(n16B); t_.iAB = upload(iAB); t_.iABp = upload(iABp);
+    t_.cimp = upload(cimp); t_.cexp = upload(cexp);
+  }
+  t_.one = upload(one);
   t_.p = upload(primes_); t_.pinv = upload(pinv); t_.k32 = upload(k32); t_.k64 = upload(k64);
   t_.v = upload(v); t_.rinv = upload(rinv); t_.mu = upload(mu); t_.pow32 = upload(pow32); t_.Mi = upload(Mi);
   t_.n = upload(nl_n); t_.nmM = upload(nl_nmM);
@@ -259,6 +353,177 @@ __global__ void __launch_bounds__(GB_THREADS, TM == 4 ? 3 : 4) k_to_rns(const ui
       const uint64_t vv = (uint64_t)hi[i][j] * k64 + (uint64_t)mid[i][j] * k32 + lo[i][j];
       X[(size_t)q * xrows * T + dst] = reduce64(vv, p, mu);
     }
+  }
+}
+
+/* RNS storage, load: x (base B residues, x < M_B / 4) -> residues mod the
+   primes of base A, by the exact extension x = sum_j sigma_j (M_B/b_j) - alpha M_B,
+   sigma_j = x_j (M_B/b_j)^-1 mod b_j, alpha = floor(sum_j sigma_j / b_j + 1/4)
+   (as the CRT of the limb conversion). Rows are the primes of A, k runs over
+   those of B; the blocks of the first row tile also copy the rows of B. Same
+   tiling and addressing as k_to_rns. alpha: the 96-bit sums of sigma_j
+   floor(2^60 / b_j), column tn + 16 tm by thread (tm, tn) for tm < 4. */
+template <int TM>
+__global__ void __launch_bounds__(GB_THREADS, TM == 4 ? 3 : 4) k_ext_load(const uint32_t *__restrict__ A, size_t ld, RowMap src_map,
+                                                         size_t src_len, size_t piece_len, size_t npieces, size_t K,
+                                                         size_t gbase, uint32_t *__restrict__ X, size_t xrows,
+                                                         size_t T, size_t dst_offset, bool reverse, RnsTables t) {
+  constexpr int TN = 4, BM = 16 * TM, BN = 16 * TN;
+  __shared__ uint32_t As[GB_K * (BM + 1)];
+  __shared__ uint32_t Bs[GB_K * BN];
+  __shared__ uint32_t vs[GB_K];
+  __shared__ size_t src_sh[BN], dst_sh[BN];
+  __shared__ uint32_t alpha_sh[BN];
+  const int tid = threadIdx.x, tm = tid / 16, tn = tid % 16;
+  const size_t n0 = gbase + (size_t)blockIdx.x * BN;
+  const int m0 = blockIdx.y * BM, PA = t.PA, PB = t.PB;
+  const bool copy_b = blockIdx.y == 0;
+  if (tid < BN) {
+    const size_t g = n0 + tid;
+    size_t src = SIZE_MAX, dst = SIZE_MAX;
+    if (g < K) {
+      const size_t rp = g / piece_len, pos = g - rp * piece_len;
+      const size_t r = rp / npieces, in_row = (rp - r * npieces) * piece_len + pos;
+      if (in_row < src_len) src = src_map(r) + in_row;
+      dst = rp * T + dst_offset + (reverse ? piece_len - 1 - pos : pos);
+    }
+    src_sh[tid] = src;
+    dst_sh[tid] = dst;
+  }
+  uint32_t lo[TM][TN] = {}, mid[TM][TN] = {}, hi[TM][TN] = {};
+  uint32_t a0 = 0, a1 = 0, a2 = 0;  // alpha sum of column tn + 16 tm (tm < 4)
+  for (int k0 = 0; k0 < PB; k0 += GB_K) {
+    __syncthreads();
+    for (int e = tid; e < GB_K * BM; e += GB_THREADS) {  // As[k][m] = (M_B/b_(k0+k)) mod a_(m0+m)
+      const int m = e / GB_K, k = e % GB_K;
+      As[k * (BM + 1) + m] = (m0 + m < PA && k0 + k < PB) ? __ldg(t.eBA + (size_t)(m0 + m) * PB + k0 + k) : 0;
+    }
+    if (tid < GB_K) vs[tid] = k0 + tid < PB ? t.v[PA + k0 + tid] : 0;
+    for (int e = tid; e < GB_K * BN; e += GB_THREADS) {  // Bs[k][n] = sigma_(k0+k) of coefficient n0+n
+      const int k = e / BN, n = e % BN, j = k0 + k;
+      const size_t src = src_sh[n];
+      uint32_t x = 0;
+      if (j < PB) {
+        x = src != SIZE_MAX ? A[(size_t)j * ld + src] : 0;
+        if (copy_b && dst_sh[n] != SIZE_MAX) X[(size_t)(PA + j) * xrows * T + dst_sh[n]] = x;
+        x = mul_shoup(x, t.ibB[j], t.ibBp[j], t.p[PA + j]);
+      }
+      Bs[k * BN + n] = x;
+    }
+    __syncthreads();
+#pragma unroll 4
+    for (int k = 0; k < GB_K; k++) tile_mac<TM, TN>(lo, mid, hi, As, BM + 1, Bs, BN, k, tm, tn);
+    if (tm < 4)
+#pragma unroll 4
+      for (int k = 0; k < GB_K; k++) mac96(a0, a1, a2, Bs[k * BN + tn + 16 * tm], vs[k]);
+  }
+  if (tm < 4) {
+    const uint64_t top = ((uint64_t)a2 << 32 | a1) + (1u << 26);  // + 1/4, then / 2^60
+    alpha_sh[tn + 16 * tm] = (uint32_t)(top >> 28);
+  }
+  __syncthreads();
+#pragma unroll
+  for (int i = 0; i < TM; i++) {
+    const int q = m0 + tm + 16 * i;
+    if (q >= PA) continue;
+    const uint32_t p = t.p[q], k64 = t.k64[q], k32 = t.k32[q], mb = t.mBA[q];
+    const uint64_t mu = t.mu[q];
+#pragma unroll
+    for (int j = 0; j < TN; j++) {
+      const size_t dst = dst_sh[tn + 16 * j];
+      if (dst == SIZE_MAX) continue;
+      const uint64_t vv = (uint64_t)hi[i][j] * k64 + (uint64_t)mid[i][j] * k32 + lo[i][j];
+      const uint32_t corr = reduce64((uint64_t)alpha_sh[tn + 16 * j] * mb, p, mu);
+      X[(size_t)q * xrows * T + dst] = sub_mod(reduce64(vv, p, mu), corr, p);
+    }
+  }
+}
+
+/* RNS storage, store: the product z (residues mod all primes, scaled as for
+   the CRT: sel = 2 logT_scale + mont) -> r = (z + q n) / M_A in base B, with
+   q = -z n^-1 mod M_A extended approximately from A to B:
+     xi_i = z_i * [scale (-n^-1) (M_A/a_i)^-1] mod a_i,
+     q' = sum_i xi_i (M_A/a_i) - alpha' M_A,  alpha' = floor(sum_i xi_i / a_i)
+   computed from below, so q' = q or q + M_A, r < z / M_A + 2 n;
+     r_j = (z_j scale + q'_j n) M_A^-1 mod b_j.
+   Rows are the primes of B, k runs over those of A; coefficient g is
+   position lo_i + g % cnt of row g / cnt of X and goes to dst(g / cnt) + g % cnt. */
+template <int TM>
+__global__ void __launch_bounds__(GB_THREADS, TM == 4 ? 3 : 4) k_ext_store(const uint32_t *__restrict__ X, size_t rows, size_t T,
+                                                          size_t lo_i, size_t cnt, size_t K, size_t gbase,
+                                                          uint32_t *__restrict__ Out, size_t ld, RowMap dst_map,
+                                                          int sel, RnsTables t) {
+  constexpr int TN = 4, BM = 16 * TM, BN = 16 * TN;
+  __shared__ uint32_t As[GB_K * (BM + 1)];
+  __shared__ uint32_t Bs[GB_K * BN];
+  __shared__ uint32_t vs[GB_K];
+  __shared__ size_t col[BN], outo[BN];
+  __shared__ uint32_t alpha_sh[BN];
+  const int tid = threadIdx.x, tm = tid / 16, tn = tid % 16;
+  const size_t n0 = gbase + (size_t)blockIdx.x * BN, qstride = rows * T;
+  const int m0 = blockIdx.y * BM, PA = t.PA, PB = t.PB;
+  const uint32_t *sA = t.sA + (size_t)sel * PA, *sAp = t.sAp + (size_t)sel * PA;
+  if (tid < BN) {
+    const size_t g = n0 + tid, row = g / cnt;
+    col[tid] = g < K ? row * T + lo_i + g % cnt : SIZE_MAX;
+    outo[tid] = g < K ? dst_map(row) + (g - row * cnt) : 0;
+  }
+  uint32_t lo[TM][TN] = {}, mid[TM][TN] = {}, hi[TM][TN] = {};
+  uint32_t a0 = 0, a1 = 0, a2 = 0;  // alpha' sum of column tn + 16 tm (tm < 4), as in k_ext_load
+  for (int k0 = 0; k0 < PA; k0 += GB_K) {
+    __syncthreads();
+    for (int e = tid; e < GB_K * BM; e += GB_THREADS) {  // As[k][m] = (M_A/a_(k0+k)) mod b_(m0+m)
+      const int m = e / GB_K, k = e % GB_K;
+      As[k * (BM + 1) + m] = (m0 + m < PB && k0 + k < PA) ? __ldg(t.eAB + (size_t)(m0 + m) * PA + k0 + k) : 0;
+    }
+    if (tid < GB_K) vs[tid] = k0 + tid < PA ? t.v[k0 + tid] : 0;
+    for (int e = tid; e < GB_K * BN; e += GB_THREADS) {  // Bs[k][n] = xi_(k0+k) of coefficient n0+n
+      const int k = e / BN, n = e % BN, i = k0 + k;
+      const size_t o = col[n];
+      Bs[k * BN + n] = (o != SIZE_MAX && i < PA) ? mul_shoup(X[(size_t)i * qstride + o], sA[i], sAp[i], t.p[i]) : 0;
+    }
+    __syncthreads();
+#pragma unroll 4
+    for (int k = 0; k < GB_K; k++) tile_mac<TM, TN>(lo, mid, hi, As, BM + 1, Bs, BN, k, tm, tn);
+    if (tm < 4)
+#pragma unroll 4
+      for (int k = 0; k < GB_K; k++) mac96(a0, a1, a2, Bs[k * BN + tn + 16 * tm], vs[k]);
+  }
+  if (tm < 4) alpha_sh[tn + 16 * tm] = (uint32_t)((((uint64_t)a2 << 32) | a1) >> 28);  // floor(sum / 2^60), from below
+  __syncthreads();
+  const uint32_t *sB = t.sB + (size_t)sel * PB, *sBp = t.sBp + (size_t)sel * PB;
+#pragma unroll
+  for (int i = 0; i < TM; i++) {
+    const int jb = m0 + tm + 16 * i;
+    if (jb >= PB) continue;
+    const int q = PA + jb;
+    const uint32_t p = t.p[q], k64 = t.k64[q], k32 = t.k32[q];
+    const uint64_t mu = t.mu[q];
+#pragma unroll
+    for (int j = 0; j < TN; j++) {
+      const int n = tn + 16 * j;
+      const size_t o = col[n];
+      if (o == SIZE_MAX) continue;
+      const uint64_t vv = (uint64_t)hi[i][j] * k64 + (uint64_t)mid[i][j] * k32 + lo[i][j];
+      const uint32_t qb = sub_mod(reduce64(vv, p, mu), reduce64((uint64_t)alpha_sh[n] * t.mAB[jb], p, mu), p);
+      const uint32_t zb = mul_shoup(X[(size_t)q * qstride + o], sB[jb], sBp[jb], p);
+      const uint32_t s = add_mod(zb, reduce64((uint64_t)qb * t.nB[jb], p, mu), p);
+      Out[(size_t)jb * ld + outo[n]] = mul_shoup(s, t.iAB[jb], t.iABp[jb], p);
+    }
+  }
+}
+
+/* X[(q*rows + r)*T + i] *= c[q] (mod p_q) for i < len */
+__global__ void k_scale_rows(uint32_t *X, size_t rows, size_t T, size_t len, const uint32_t *__restrict__ c,
+                             RnsTables t) {
+  const int q = blockIdx.y;
+  const uint32_t p = t.p[q], cq = c[q];
+  const uint64_t mu = t.mu[q];
+  const size_t total = rows * len;
+  for (size_t e = (size_t)blockIdx.x * blockDim.x + threadIdx.x; e < total; e += (size_t)gridDim.x * blockDim.x) {
+    const size_t r = e / len, i = e - r * len;
+    uint32_t *x = X + ((size_t)q * rows + r) * T + i;
+    *x = reduce64((uint64_t)*x * cq, p, mu);
   }
 }
 
@@ -758,7 +1023,7 @@ __global__ void k_pad(uint32_t *__restrict__ X, size_t xrows, size_t T, size_t o
                       RnsTables t) {
   const int q = blockIdx.y;
   const uint32_t p = t.p[q];
-  const uint32_t cc = c >= 0 ? (uint32_t)c % p : p - (uint32_t)(-c) % p;
+  const uint32_t cc = reduce64((uint64_t)(c >= 0 ? (uint32_t)c % p : p - (uint32_t)(-c) % p) * t.one[q], p, t.mu[q]);
   const size_t pad = T - len, total = xrows * pad;
   for (size_t e = (size_t)blockIdx.x * blockDim.x + threadIdx.x; e < total; e += (size_t)gridDim.x * blockDim.x) {
     const size_t r = e / pad, k = e - r * pad, i = k < off ? k : k + len;
@@ -811,6 +1076,15 @@ void RnsContext::from_limbs_map(const uint32_t *A, size_t ld, const RowMap &src,
     CUDA_CHECK(cudaGetLastError());
   }
   if (K == 0) return;
+  if (rns_store()) store_to_rns(A, ld, src, rows, src_len, piece_len, npieces, X, T, dst_offset, reverse, s);
+  else limbs_to_rns(A, ld, src, rows, src_len, piece_len, npieces, X, T, dst_offset, reverse, s);
+  if (lead_in_data) add_const(X, xrows, T, (size_t)lead_pos, lead_c, s);  // after the data is written
+}
+
+void RnsContext::limbs_to_rns(const uint32_t *A, size_t ld, const RowMap &src, size_t rows, size_t src_len,
+                              size_t piece_len, size_t npieces, uint32_t *X, size_t T, size_t dst_offset, bool reverse,
+                              cudaStream_t s) const {
+  const size_t xrows = rows * npieces, K = xrows * piece_len;
   const int tm = choose_tm(t_.P);
   const size_t slice = balanced_slice(K, conv_slice(t_.P, t_.nlimbs));
   for (size_t g0 = 0; g0 < K; g0 += slice) {
@@ -825,10 +1099,103 @@ void RnsContext::from_limbs_map(const uint32_t *A, size_t ld, const RowMap &src,
 #undef GPUECM2_TO_RNS
     CUDA_CHECK(cudaGetLastError());
   }
-  if (lead_in_data) add_const(X, xrows, T, (size_t)lead_pos, lead_c, s);  // after the data is written
+}
+
+void RnsContext::store_to_rns(const uint32_t *A, size_t ld, const RowMap &src, size_t rows, size_t src_len,
+                              size_t piece_len, size_t npieces, uint32_t *X, size_t T, size_t dst_offset, bool reverse,
+                              cudaStream_t s) const {
+  const size_t xrows = rows * npieces, K = xrows * piece_len;
+  const int tm = choose_tm(t_.PA);
+  const size_t slice = balanced_slice(K, conv_slice(t_.PA, t_.PB));
+  for (size_t g0 = 0; g0 < K; g0 += slice) {
+    const size_t k = std::min(slice, K - g0);
+    const dim3 grid((unsigned)((k + 63) / 64), (unsigned)((t_.PA + 16 * tm - 1) / (16 * tm)));
+#define GPUECM2_EXT_LOAD(TM)                                                                                          \
+  k_ext_load<TM><<<grid, GB_THREADS, 0, s>>>(A, ld, src, src_len, piece_len, npieces, K, g0, X, xrows, T, dst_offset, \
+                                             reverse, t_)
+    if (tm == 4) GPUECM2_EXT_LOAD(4);
+    else if (tm == 3) GPUECM2_EXT_LOAD(3);
+    else GPUECM2_EXT_LOAD(2);
+#undef GPUECM2_EXT_LOAD
+    CUDA_CHECK(cudaGetLastError());
+  }
+}
+
+void RnsContext::rns_to_store(const uint32_t *X, size_t rows, size_t T, size_t lo, size_t cnt, uint32_t *Out,
+                              size_t ld, const RowMap &dst, int logT_scale, int mont, cudaStream_t s) const {
+  const size_t K = rows * cnt;
+  const int tm = choose_tm(t_.PB), sel = logT_scale * 2 + (mont ? 1 : 0);
+  const size_t slice = balanced_slice(K, conv_slice(t_.PA, t_.PB));
+  for (size_t g0 = 0; g0 < K; g0 += slice) {
+    const size_t k = std::min(slice, K - g0);
+    const dim3 grid((unsigned)((k + 63) / 64), (unsigned)((t_.PB + 16 * tm - 1) / (16 * tm)));
+#define GPUECM2_EXT_STORE(TM) \
+  k_ext_store<TM><<<grid, GB_THREADS, 0, s>>>(X, rows, T, lo, cnt, K, g0, Out, ld, dst, sel, t_)
+    if (tm == 4) GPUECM2_EXT_STORE(4);
+    else if (tm == 3) GPUECM2_EXT_STORE(3);
+    else GPUECM2_EXT_STORE(2);
+#undef GPUECM2_EXT_STORE
+    CUDA_CHECK(cudaGetLastError());
+  }
+}
+
+/* Chunks of the import / export conversions: P words of scratch per coefficient */
+size_t imex_chunk(size_t count, int P) {
+  return std::min(count, std::max<size_t>(1024, RNS_IMEX_SCRATCH / (4 * (size_t)P)));
+}
+
+void RnsContext::import_limbs(const uint32_t *A, size_t lda, size_t count, uint32_t *Out, size_t ldo,
+                              cudaStream_t s) const {
+  if (!count) return;
+  if (!rns_store()) {
+    CUDA_CHECK(cudaMemcpy2DAsync(Out, ldo * 4, A, lda * 4, count * 4, t_.nlimbs, cudaMemcpyDeviceToDevice, s));
+    return;
+  }
+  /* x -> x (M_A^2 mod n) in all primes (< n^2), then the Montgomery reduction gives x M_A mod n */
+  const size_t c0 = imex_chunk(count, t_.P);
+  uint32_t *X;
+  CUDA_CHECK(cudaMallocAsync(&X, (size_t)t_.P * c0 * 4, s));
+  for (size_t g0 = 0; g0 < count; g0 += c0) {
+    const size_t c = std::min(c0, count - g0);
+    limbs_to_rns(A + g0, lda, RowMap::dense(c), 1, c, c, 1, X, c, 0, false, s);
+    const size_t b = (c + 255) / 256;
+    k_scale_rows<<<dim3((unsigned)(b < 8192 ? b : 8192), t_.P), 256, 0, s>>>(X, 1, c, c, t_.cimp, t_);
+    CUDA_CHECK(cudaGetLastError());
+    rns_to_store(X, 1, c, 0, c, Out + g0, ldo, RowMap::dense(c), 0, 0, s);
+  }
+  CUDA_CHECK(cudaFreeAsync(X, s));
+}
+
+void RnsContext::export_limbs(const uint32_t *A, size_t lda, size_t count, uint32_t *Out, size_t ldo,
+                              cudaStream_t s) const {
+  if (!count) return;
+  if (!rns_store()) {
+    CUDA_CHECK(cudaMemcpy2DAsync(Out, ldo * 4, A, lda * 4, count * 4, t_.nlimbs, cudaMemcpyDeviceToDevice, s));
+    return;
+  }
+  /* x (= c M_A mod n, < 64 n) -> x (M_A^-1 mod n) in all primes (< 64 n^2), then the CRT mod n */
+  const size_t c0 = imex_chunk(count, t_.P);
+  uint32_t *X;
+  CUDA_CHECK(cudaMallocAsync(&X, (size_t)t_.P * c0 * 4, s));
+  for (size_t g0 = 0; g0 < count; g0 += c0) {
+    const size_t c = std::min(c0, count - g0);
+    store_to_rns(A + g0, lda, RowMap::dense(c), 1, c, c, 1, X, c, 0, false, s);
+    const size_t b = (c + 255) / 256;
+    k_scale_rows<<<dim3((unsigned)(b < 8192 ? b : 8192), t_.P), 256, 0, s>>>(X, 1, c, c, t_.cexp, t_);
+    CUDA_CHECK(cudaGetLastError());
+    rns_to_limbs(X, 1, c, 0, c, Out + g0, ldo, RowMap::dense(c), 0, 0, s);
+  }
+  CUDA_CHECK(cudaFreeAsync(X, s));
 }
 
 void RnsContext::to_limbs_map(const uint32_t *X, size_t rows, size_t T, size_t lo, size_t cnt, uint32_t *Out,
+                              size_t ld, const RowMap &dst, int logT_scale, int mont, cudaStream_t s) const {
+  if (rows * cnt == 0) return;
+  if (rns_store()) rns_to_store(X, rows, T, lo, cnt, Out, ld, dst, logT_scale, mont, s);
+  else rns_to_limbs(X, rows, T, lo, cnt, Out, ld, dst, logT_scale, mont, s);
+}
+
+void RnsContext::rns_to_limbs(const uint32_t *X, size_t rows, size_t T, size_t lo, size_t cnt, uint32_t *Out,
                               size_t ld, const RowMap &dst, int logT_scale, int mont, cudaStream_t s) const {
   const size_t K = rows * cnt;
   if (K == 0) return;
@@ -911,7 +1278,7 @@ namespace {
 __global__ void k_add_const(uint32_t *X, size_t rows, size_t T, size_t pos, int c, RnsTables t) {
   const int q = blockIdx.y;
   const uint32_t p = t.p[q];
-  const uint32_t cc = c >= 0 ? (uint32_t)c % p : p - (uint32_t)(-c) % p;
+  const uint32_t cc = reduce64((uint64_t)(c >= 0 ? (uint32_t)c % p : p - (uint32_t)(-c) % p) * t.one[q], p, t.mu[q]);
   for (size_t r = (size_t)blockIdx.x * blockDim.x + threadIdx.x; r < rows; r += (size_t)gridDim.x * blockDim.x) {
     uint32_t *x = X + ((size_t)q * rows + r) * T + pos;
     uint32_t v = *x + cc;  // both < 2^31

@@ -10,7 +10,21 @@
    Device layouts:
      residues mod n ("limb arrays"): limb j of coefficient g at A[j*ld + g],
        32-bit limbs, nlimbs = ceil(bits(n)/32); g = row*len + i for batches.
-     RNS arrays: X[(q*rows + row)*T + i] for prime q, polynomial row, index i. */
+     RNS arrays: X[(q*rows + row)*T + i] for prime q, polynomial row, index i.
+
+   Two ways of storing the coefficients of polynomials (the "limb arrays" of
+   the polynomial code, coef_words() 32-bit words per coefficient, same layout):
+     limbs (default): the residue mod n in nlimbs limbs, fully reduced;
+     RNS storage (init with rns_store): the primes are split into a base A (the
+       first PA) and a base B (the last PB), and a coefficient c is stored as
+       the residues mod the primes of B of an x = c M_A mod n (Montgomery form,
+       M_A the product of the primes of A), 0 <= x < 64 n. Products then need
+       no conversion to limbs: a base extension B -> A before the transform
+       ("from_limbs") and a Montgomery reduction after it (q mod A, extension
+       A -> B, r = (z + q n) / M_A in B; "to_limbs"), about half the work of
+       the two conversions. The constant 1 is stored as M_A mod n. Values
+       given to or taken from the GPU code outside the polynomial arithmetic
+       (roots, final values) are converted with import_limbs / export_limbs. */
 #pragma once
 #include <cstddef>
 #include <cstdint>
@@ -43,7 +57,7 @@ struct RowMap {
 struct RnsTables {  // device pointers, passed to kernels by value
   int P = 0, nlimbs = 0, logTmax = 0;
   const uint32_t *p, *pinv, *k32, *k64, *v;  // [P]
-  const uint32_t *rinv;                      // [P] 2^-32 mod p
+  const uint32_t *rinv;                      // [P] 2^-32 one^2 mod p (the wrapped lead)
   const uint64_t *mu;                        // [P] floor(2^64/p)
   const uint32_t *pow32;                     // [P][nlimbs]  2^(32j) mod p
   const uint32_t *Mi;                        // [P][nlimbs]  (M/p) mod n
@@ -55,6 +69,19 @@ struct RnsTables {  // device pointers, passed to kernels by value
      TH = omega_Tmax^(2048 h) (h < Tmax/2048) */
   const uint32_t *w, *wp, *iw, *iwp;         // [P][2048]
   const uint32_t *TL, *TH, *iTL, *iTH;       // [P][2048], [P][Tmax/2048]
+  /* the representation of the constant 1 in RNS arrays: 1 (limbs) or M_A mod n */
+  const uint32_t *one;                       // [P]
+  /* RNS storage (PA = PB = 0 with limbs); base A = primes 0..PA-1, B = PA..P-1 */
+  int PA = 0, PB = 0, cw = 0;                // cw: words per stored coefficient (nlimbs or PB)
+  const uint32_t *eBA;                       // [PA][PB] (M_B / b_j) mod a_i
+  const uint32_t *ibB, *ibBp;                // [PB] (M_B / b_j)^-1 mod b_j (+Shoup)
+  const uint32_t *mBA;                       // [PA] M_B mod a_i
+  const uint32_t *eAB;                       // [PB][PA] (M_A / a_i) mod b_j
+  const uint32_t *sA, *sAp;                  // [logTmax+1][2][PA] scale * (-n^-1) * (M_A/a_i)^-1 mod a_i (+Shoup)
+  const uint32_t *sB, *sBp;                  // [logTmax+1][2][PB] scale mod b_j (+Shoup)
+  const uint32_t *mAB, *nB, *n16B;           // [PB] M_A, n, 16 n mod b_j
+  const uint32_t *iAB, *iABp;                // [PB] M_A^-1 mod b_j (+Shoup)
+  const uint32_t *cimp, *cexp;               // [P] (M_A^2 mod n), (M_A^-1 mod n) mod p_q: import / export
 };
 
 class RnsContext {
@@ -68,11 +95,18 @@ class RnsContext {
      shorter factor has at most max_operand_len coefficients are exact.
      want_logT is the largest NTT length (log2) wanted; a smaller one is used
      if there are not enough suitable primes. */
-  bool init(const mpz_t n, size_t max_operand_len, int want_logT, std::string *err);
+  bool init(const mpz_t n, size_t max_operand_len, int want_logT, std::string *err, bool rns_store = false);
 
   const RnsTables &tables() const { return t_; }
   int P() const { return t_.P; }
   int nlimbs() const { return t_.nlimbs; }
+  bool rns_store() const { return t_.PB > 0; }
+  /* 32-bit words per coefficient of the polynomial code's arrays */
+  int coef_words() const { return t_.cw; }
+  /* stored coefficients from / to plain limb arrays (fully reduced residues
+     mod n; with limbs a copy): count coefficients, leading dimensions lda, ldo */
+  void import_limbs(const uint32_t *A, size_t lda, size_t count, uint32_t *Out, size_t ldo, cudaStream_t s = 0) const;
+  void export_limbs(const uint32_t *A, size_t lda, size_t count, uint32_t *Out, size_t ldo, cudaStream_t s = 0) const;
   int logTmax() const { return t_.logTmax; }
   const std::vector<uint32_t> &primes() const { return primes_; }
 
@@ -107,7 +141,8 @@ class RnsContext {
   /* X[row][pos] += c (mod each prime), c a small signed constant, for all rows */
   void add_const(uint32_t *X, size_t rows, size_t T, size_t pos, int c, cudaStream_t s = 0) const;
 
-  /* Out := coefficients lo..lo+cnt-1 of each row of X, mapped back mod n.
+  /* (With RNS storage, "limbs" below means stored coefficients.)
+     Out := coefficients lo..lo+cnt-1 of each row of X, mapped back mod n.
      The residues are first multiplied by 2^(32*mont) / 2^logT_scale, which
      undoes `mont` Montgomery multiplications and an unnormalised inverse NTT
      of length 2^logT_scale (use 0 for neither). Output coefficient
@@ -121,6 +156,16 @@ class RnsContext {
                     const RowMap &dst, int logT_scale, int mont, cudaStream_t s = 0) const;
 
  private:
+  /* the conversions between limbs and RNS arrays (for every mode) */
+  void limbs_to_rns(const uint32_t *A, size_t ld, const RowMap &src, size_t rows, size_t src_len, size_t piece_len,
+                    size_t npieces, uint32_t *X, size_t T, size_t dst_offset, bool reverse, cudaStream_t s) const;
+  void rns_to_limbs(const uint32_t *X, size_t rows, size_t T, size_t lo, size_t cnt, uint32_t *Out, size_t ld,
+                    const RowMap &dst, int logT_scale, int mont, cudaStream_t s) const;
+  /* RNS storage: base extension B -> A (all primes) and Montgomery reduction to B */
+  void store_to_rns(const uint32_t *A, size_t ld, const RowMap &src, size_t rows, size_t src_len, size_t piece_len,
+                    size_t npieces, uint32_t *X, size_t T, size_t dst_offset, bool reverse, cudaStream_t s) const;
+  void rns_to_store(const uint32_t *X, size_t rows, size_t T, size_t lo, size_t cnt, uint32_t *Out, size_t ld,
+                    const RowMap &dst, int logT_scale, int mont, cudaStream_t s) const;
   RnsTables t_;
   std::vector<uint32_t> primes_;
   std::vector<void *> allocs_;

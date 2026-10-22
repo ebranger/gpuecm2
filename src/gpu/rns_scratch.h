@@ -9,3 +9,5 @@
    stage2_gpu_bytes. (A header of its own: rns.h is included by every CGBN
    size's translation unit.) */
 constexpr size_t RNS_TO_LIMBS_SCRATCH = (size_t)128 << 20;
+/* ... and of the import / export of RNS storage (RnsContext::import_limbs) */
+constexpr size_t RNS_IMEX_SCRATCH = (size_t)64 << 20;

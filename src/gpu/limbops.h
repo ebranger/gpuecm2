@@ -3,7 +3,11 @@
    License, version 3 or later. See COPYING.LESSER and COPYING.
 
    Element-wise operations on limb arrays of residues mod n (layout as in rns.h:
-   limb j of coefficient g at A[j*ld + g]). Inputs must be reduced (< n). */
+   limb j of coefficient g at A[j*ld + g]). Inputs must be reduced (< n).
+   With RNS storage (RnsContext::rns_store) the arrays hold that representation
+   instead (coef_words() words per coefficient, integers below 64 n as stored
+   by to_limbs_map, which gives < 4 n): sums are not reduced, and a difference
+   or negation adds 16 n, so its subtrahend must be < 16 n. */
 #pragma once
 #include <cstddef>
 #include <cstdint>
@@ -55,6 +59,6 @@ void limb_gather_rows(const RnsContext &ctx, const uint32_t *A, size_t lda, size
 void limb_scatter_rows(const RnsContext &ctx, const uint32_t *Src, size_t lds, size_t rows, size_t cnt, uint32_t *Dst,
                        size_t ldd, size_t dst_stride, size_t dst_off, cudaStream_t s = 0);
 
-/* limb-array allocation helpers (stream-ordered) */
+/* limb-array allocation helpers (stream-ordered; coef_words() words per coefficient) */
 uint32_t *limb_alloc(const RnsContext &ctx, size_t count, cudaStream_t s = 0);
 void limb_free(uint32_t *p, cudaStream_t s = 0);

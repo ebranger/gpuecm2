@@ -73,12 +73,13 @@ __device__ __forceinline__ uint32_t mulmod_b(uint32_t a, uint32_t b, uint32_t p,
 
 /* Products of pairs of monic degree-M polynomials directly on residues (no
    transform): X holds 2*count rows of M coefficients (left, right child),
-   Y gets count rows of 2M coefficients (leading 1 implicit). Exact values. */
+   Y gets count rows of 2M coefficients (leading 1 implicit). Exact values.
+   The leading 1 is RnsTables::one, as everywhere in RNS arrays. */
 template <int M>
 __global__ void k_small_monic_pairs(const uint32_t *__restrict__ X, uint32_t *__restrict__ Y, size_t count,
                                     RnsTables t) {
   const int q = blockIdx.y;
-  const uint32_t p = t.p[q];
+  const uint32_t p = t.p[q], one = t.one[q];
   const uint64_t mu = t.mu[q];
   for (size_t j = (size_t)blockIdx.x * blockDim.x + threadIdx.x; j < count; j += (size_t)gridDim.x * blockDim.x) {
     const uint32_t *a = X + ((size_t)q * 2 * count + 2 * j) * M, *b = a + M;
@@ -90,7 +91,7 @@ __global__ void k_small_monic_pairs(const uint32_t *__restrict__ X, uint32_t *__
 #pragma unroll
       for (int jj = 0; jj <= M; jj++) {
         if (i + jj >= 2 * M) continue;
-        uint32_t ai = i < M ? a[i] : 1, bj = jj < M ? b[jj] : 1;
+        uint32_t ai = i < M ? a[i] : one, bj = jj < M ? b[jj] : one;
         c[i + jj] = add_mod(c[i + jj], mulmod_b(ai, bj, p, mu), p);
       }
     uint32_t *y = Y + ((size_t)q * count + j) * 2 * M;
@@ -107,7 +108,7 @@ template <int M>
 __global__ void k_small_tmul(const uint32_t *__restrict__ B, const uint32_t *__restrict__ C, uint32_t *__restrict__ Z,
                              size_t count, RnsTables t) {
   const int q = blockIdx.y;
-  const uint32_t p = t.p[q];
+  const uint32_t p = t.p[q], one = t.one[q];
   const uint64_t mu = t.mu[q];
   for (size_t e = (size_t)blockIdx.x * blockDim.x + threadIdx.x; e < 2 * count; e += (size_t)gridDim.x * blockDim.x) {
     const size_t j = e / 2;
@@ -116,7 +117,7 @@ __global__ void k_small_tmul(const uint32_t *__restrict__ B, const uint32_t *__r
     uint32_t *z = Z + ((size_t)q * 2 * count + e) * M;
 #pragma unroll
     for (int i = 0; i < M; i++) {
-      uint32_t r = b[i + M];  // leading coefficient 1 of the sibling
+      uint32_t r = mulmod_b(b[i + M], one, p, mu);  // leading coefficient 1 of the sibling
 #pragma unroll
       for (int jj = 0; jj < M; jj++) r = add_mod(r, mulmod_b(c[jj], b[i + jj], p, mu), p);
       z[i] = r;

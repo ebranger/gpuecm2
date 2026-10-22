@@ -1,7 +1,7 @@
 /* Benchmark of the polynomial part of ECM stage 2 with GMP-ECM's structure:
    F tree, 1/F, k blocks of (G from roots, H = (G-F) H mod F), evaluation.
    Roots are random; the curve arithmetic (root generation) is not included.
-   Usage: bench_poly <bits> <dF> <k> */
+   Usage: bench_poly <bits> <dF> <k> [rns]  (rns: RNS storage of the polynomials) */
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -43,13 +43,15 @@ static uint32_t *random_vec(const RnsContext &ctx, size_t n, const mpz_t N, gmp_
     for (int j = 0; j < nl; j++) h[(size_t)j * n + g] = tmp[j];
   }
   uint32_t *d;
-  CUDA_CHECK(cudaMalloc(&d, h.size() * 4));
+  CUDA_CHECK(cudaMalloc(&d, (size_t)ctx.coef_words() * n * 4));
   CUDA_CHECK(cudaMemcpy(d, h.data(), h.size() * 4, cudaMemcpyHostToDevice));
+  ctx.import_limbs(d, n, n, d, n);
   return d;
 }
 
 int main(int argc, char **argv) {
-  if (argc < 4) { fprintf(stderr, "usage: bench_poly bits dF k\n"); return 1; }
+  if (argc < 4) { fprintf(stderr, "usage: bench_poly bits dF k [rns]\n"); return 1; }
+  const bool rns = argc > 4 && std::string(argv[4]) == "rns";
   const int bits = atoi(argv[1]);
   const size_t n = (size_t)atol(argv[2]);
   const int k = atoi(argv[3]);
@@ -58,14 +60,21 @@ int main(int argc, char **argv) {
   gmp_randseed_ui(rs, 5);
   Z N;
   mpz_urandomb(N.get(), rs, bits); mpz_setbit(N.get(), bits - 1); mpz_setbit(N.get(), 0);
+  {  // as Stage2Engine: the stream-ordered pool keeps its memory between synchronisations
+    cudaMemPool_t pool;
+    uint64_t keep = UINT64_MAX;
+    if (cudaDeviceGetDefaultMemPool(&pool, 0) == cudaSuccess)
+      cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &keep);
+  }
   RnsContext ctx;
   std::string err;
   int lg = 0;
   while (((size_t)1 << lg) < 2 * n) lg++;
-  if (!ctx.init(N.get(), 2 * n + 2, lg, &err)) { printf("init failed: %s\n", err.c_str()); return 1; }
+  if (!ctx.init(N.get(), 2 * n + 2, lg, &err, rns)) { printf("init failed: %s\n", err.c_str()); return 1; }
   cudaDeviceProp pr;
   cudaGetDeviceProperties(&pr, 0);
-  printf("%s: %d-bit N, dF=%zu, k=%d, %d primes, Tmax=2^%d\n", pr.name, bits, n, k, ctx.P(), ctx.logTmax());
+  printf("%s: %d-bit N, dF=%zu, k=%d, %d primes, Tmax=2^%d%s\n", pr.name, bits, n, k, ctx.P(), ctx.logTmax(),
+         rns ? ", RNS storage" : "");
 
   uint32_t *rootsF = random_vec(ctx, n, N.get(), rs);
   std::vector<uint32_t *> rootsG;

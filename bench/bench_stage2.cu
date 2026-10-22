@@ -2,7 +2,7 @@
    parameters. N is an RSA challenge number (tests/data/rsa_numbers.txt), a
    product of them ("RSA-2048*RSA-1024"), a bit size (random RSA-like N), or
    "@file": the N of the first line of a GMP-ECM resume file.
-   Usage: bench_stage2 <N> <B1> [B2] [-power n | -dickson n] [-k n] [-maxmem MB] [-reps r] [-untimed 1] [-treecache 1]
+   Usage: bench_stage2 <N> <B1> [B2] [-power n | -dickson n] [-k n] [-maxmem MB] [-reps r] [-untimed 1] [-treecache 1] [-rns 1]
                        [-batch b] [-spin 1]
    (-untimed: no synchronisation between phases; only the total is meaningful;
    -batch: b curves per run, times per curve; 0: automatic batch size) */
@@ -95,6 +95,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[argi], "-maxmem")) req.maxmem = atof(argv[argi + 1]) * 1048576.;
     else if (!strcmp(argv[argi], "-spin")) spin = atoi(argv[argi + 1]) != 0;
     else if (!strcmp(argv[argi], "-treecache")) treecache = atoi(argv[argi + 1]) != 0;
+    else if (!strcmp(argv[argi], "-rns")) stage2_set_rns_store(atoi(argv[argi + 1]) != 0);
     else { fprintf(stderr, "unknown option %s\n", argv[argi]); return 1; }
   }
   stage2_cpu_wait(spin);
