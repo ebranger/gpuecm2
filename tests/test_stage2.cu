@@ -13,7 +13,9 @@
 #include <gmp.h>
 
 #include "api/stage2.h"
+#include "gpu/cgbn_sizes.h"
 #include "host/params.h"
+#include "random_number.h"
 
 static int failures = 0;
 
@@ -38,8 +40,8 @@ static void run_case(int bits, double B1, int S) {
   MontgomeryCurve C;
   {  // RSA-like modulus
     Z p, q;
-    mpz_urandomb(p.get(), rs, bits / 2); mpz_setbit(p.get(), bits / 2 - 1); mpz_nextprime(p.get(), p.get());
-    mpz_urandomb(q.get(), rs, bits - bits / 2); mpz_setbit(q.get(), bits - bits / 2 - 1); mpz_nextprime(q.get(), q.get());
+    random_hard_number(p.get(), rs, bits / 2);
+    random_hard_number(q.get(), rs, bits - bits / 2);
     mpz_mul(C.n.get(), p.get(), q.get());
   }
   Stage2Request req;
@@ -74,9 +76,8 @@ static void run_case(int bits, double B1, int S) {
 int main() {
   run_case(400, 2e4, 0);
   run_case(1000, 1e5, -12);
-#ifndef GPUECM2_ONLY_BITS
-  run_case(2100, 5e4, 0);
-#endif
+  if (GPUECM2_MAX_BITS >= 2100) run_case(2100, 5e4, 0);
+  if (GPUECM2_MAX_BITS >= 12000) run_case(12000, 2e3, -6);
   printf("%s (%d failures)\n", failures ? "FAIL" : "OK", failures);
   return failures != 0;
 }

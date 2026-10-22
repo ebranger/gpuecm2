@@ -13,7 +13,10 @@
 #include <cstdlib>
 #include <vector>
 
+#include "gpu/cgbn_ops.h"
 #include "gpu/cuda_check.h"
+
+#ifdef GPUECM2_SIZE_BITS  // compiled once per CGBN size, in roots_<BITS>.cu (see gpu/cgbn_ops.h)
 #include "gpu/ecc.cuh"
 
 namespace {
@@ -73,12 +76,31 @@ constexpr uint32_t chain_tpi(uint32_t bits) {
   return bits % 1024 == 0 ? 32 : bits % 512 == 0 ? 16 : 8;
 }
 
-/* table[t*WTAB + 0] = 2^(WIN t) P for t < W (sequential; one instance per
-   curve, i.e. per block: curve c's constants at cur + c*C_COUNT, its table
-   at entry c*ntab) */
+/* Kernels whose threads run long sequences of curve operations are split into
+   launches of a few tens of ms at most (Windows' watchdog; a display on the
+   GPU). Both costs grow as BITS^2 (measured at 32768 bits on an RTX 4070 Ti
+   SUPER): a doubling of the chain (one thread group per curve) takes 1.3 ms,
+   hence 4 windows of WIN doublings per launch; an instance-window of the
+   fixed-base multiplication (the GPU full) 0.6 us, hence 32768 per launch.
+   Smaller sizes are not split in practice. GPUECM2_SPLIT_LAUNCHES=1 (testing
+   aid) splits them into very short launches. */
+bool split_all() {
+  static const bool s = getenv("GPUECM2_SPLIT_LAUNCHES") != nullptr;
+  return s;
+}
+int chain_windows(uint32_t bits) {  // windows (WIN doublings each) per launch of k_pow2_chain
+  return split_all() ? 1 : (int)std::max<uint64_t>(1, ((uint64_t)1 << 32) / ((uint64_t)bits * bits));
+}
+size_t mul_units(uint32_t bits) {  // instance-windows per launch of k_scalar_mul_tab
+  return split_all() ? 64 : (size_t)std::max<uint64_t>(1024, ((uint64_t)1 << 45) / ((uint64_t)bits * bits));
+}
+
+/* table[t*WTAB + 0] = 2^(WIN t) P for t0 <= t < t1 (sequential; one instance
+   per curve, i.e. per block: curve c's constants at cur + c*C_COUNT, its table
+   at entry c*ntab); a launch with t0 > 0 continues from entry t0 - 1 */
 template <uint32_t TPI, uint32_t BITS>
-__global__ void k_pow2_chain(const cgbn_mem_t<BITS> *cur, uint32_t np0, int W, size_t ntab, cgbn_mem_t<BITS> *TX,
-                             cgbn_mem_t<BITS> *TY, cgbn_mem_t<BITS> *TZ, cgbn_mem_t<BITS> *TT) {
+__global__ void k_pow2_chain(const cgbn_mem_t<BITS> *cur, uint32_t np0, int t0, int t1, size_t ntab,
+                             cgbn_mem_t<BITS> *TX, cgbn_mem_t<BITS> *TY, cgbn_mem_t<BITS> *TZ, cgbn_mem_t<BITS> *TT) {
   typedef K<TPI, BITS> T;
   cur += (size_t)blockIdx.x * C_COUNT;
   TX += blockIdx.x * ntab; TY += blockIdx.x * ntab; TZ += blockIdx.x * ntab; TT += blockIdx.x * ntab;
@@ -87,10 +109,12 @@ __global__ void k_pow2_chain(const cgbn_mem_t<BITS> *cur, uint32_t np0, int W, s
   typename T::bn_t a;
   cgbn_load(E.env, a, mp(&cur[C_A]));
   typename T::Pt Q;
-  load_pt(E, Q, &cur[C_PX], &cur[C_PY], &cur[C_PZ], &cur[C_PT], 0);
-  for (int t = 0; t < W; t++) {
+  if (t0 == 0) load_pt(E, Q, &cur[C_PX], &cur[C_PY], &cur[C_PZ], &cur[C_PT], 0);
+  else load_pt(E, Q, TX, TY, TZ, TT, (size_t)(t0 - 1) * WTAB);
+  for (int t = t0; t < t1; t++) {  // (one place with doublings: the code is large at large sizes)
+    if (t > 0)
+      for (int i = 0; i < WIN; i++) E.pdbl(Q, Q, a);
     store_pt(E, Q, TX, TY, TZ, TT, (size_t)t * WTAB);
-    for (int i = 0; i < WIN; i++) E.pdbl(Q, Q, a);
   }
 }
 
@@ -142,16 +166,17 @@ __global__ void k_affine(const cgbn_mem_t<BITS> *cur, uint32_t np0, size_t count
 
 /* F[c*count + i] = scal_i * P_c with curve c's fixed-base table (affine
    entries, at c*ntab): one mixed addition per nonzero window digit, no
-   doublings */
+   doublings. This launch: outputs o0 .. o0+n-1, windows t0 .. t1-1 (a launch
+   with t0 > 0 continues from the partial sums in F) */
 template <uint32_t TPI, uint32_t BITS>
 __global__ void k_scalar_mul_tab(const cgbn_mem_t<BITS> *cur, uint32_t np0, const uint32_t *scal, int swords,
-                                 const int32_t *nbits, size_t count, size_t ncurves, size_t ntab,
-                                 const cgbn_mem_t<BITS> *TX, const cgbn_mem_t<BITS> *TY, const cgbn_mem_t<BITS> *TT,
-                                 cgbn_mem_t<BITS> *FX, cgbn_mem_t<BITS> *FY, cgbn_mem_t<BITS> *FZ,
-                                 cgbn_mem_t<BITS> *FT) {
+                                 const int32_t *nbits, size_t count, size_t ncurves, size_t ntab, size_t o0, size_t n,
+                                 int t0, int t1, const cgbn_mem_t<BITS> *TX, const cgbn_mem_t<BITS> *TY,
+                                 const cgbn_mem_t<BITS> *TT, cgbn_mem_t<BITS> *FX, cgbn_mem_t<BITS> *FY,
+                                 cgbn_mem_t<BITS> *FZ, cgbn_mem_t<BITS> *FT) {
   typedef K<TPI, BITS> T;
-  const size_t out = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) / TPI;
-  if (out >= count * ncurves) return;
+  const size_t loc = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) / TPI, out = o0 + loc;
+  if (loc >= n || out >= count * ncurves) return;
   const size_t cv = out / count, inst = out - cv * count;
   cur += cv * C_COUNT;
   TX += cv * ntab; TY += cv * ntab; TT += cv * ntab;
@@ -162,11 +187,13 @@ __global__ void k_scalar_mul_tab(const cgbn_mem_t<BITS> *cur, uint32_t np0, cons
   cgbn_load(E.env, d, mp(&cur[C_D]));
   cgbn_load(E.env, one, mp(&cur[C_ONE]));
   typename T::Pt R, Q;
-  E.set_neutral(R, one);
   const int32_t nb = nbits[inst];
   const int bits = nb < 0 ? -nb : nb;
+  if (t0 > 0 && t0 * WIN >= bits) return;  // done in an earlier launch
+  if (t0 == 0) E.set_neutral(R, one);
+  else load_pt(E, R, FX, FY, FZ, FT, out);
   const uint32_t *s = scal + inst * swords;
-  for (int t = 0; t * WIN < bits; t++) {
+  for (int t = t0; t < t1 && t * WIN < bits; t++) {
     const int b0 = t * WIN, w0 = b0 >> 5, sh = b0 & 31;
     uint64_t two = s[w0] | (w0 + 1 < swords ? (uint64_t)s[w0 + 1] << 32 : 0);
     const int dg = (int)((two >> sh) & WTAB);
@@ -177,7 +204,7 @@ __global__ void k_scalar_mul_tab(const cgbn_mem_t<BITS> *cur, uint32_t np0, cons
     cgbn_load(E.env, Q.T, mp(&TT[e]));
     E.template padd<true>(R, R, Q, a, d);
   }
-  if (nb < 0) E.pneg(R);
+  if (nb < 0 && t1 * WIN >= bits) E.pneg(R);
   store_pt(E, R, FX, FY, FZ, FT, out);
 }
 
@@ -208,6 +235,24 @@ __global__ void __launch_bounds__(BLOCK, step_min_blocks(TPI, BITS)) k_step(cons
   cur += cv * C_COUNT;
   typename T::ctx_t ctx(cgbn_no_checks);
   typename T::Env E(ctx, &cur[C_N], np0);
+  if constexpr (BITS > 4608) {  // large sizes: operands from memory where they are used (see padd_mem)
+    if (i == 0) {
+      int64_t sl = slot ? (int64_t)slot[n * nprog + p] : sbase[p] + (int64_t)n * sinc;
+      if (!slot && sl >= (int64_t)count) sl = -1;
+      if (sl >= 0) {
+        const size_t blk = (size_t)sl / blen, o = ((blk % nring) * ncurves + cv) * blen + ((size_t)sl - blk * blen);
+        typename T::bn_t y, z, t;
+        E.ld(y, RY, base);
+        E.ld(z, RZ, base);
+        E.add(t, z, y);
+        cgbn_store(E.env, &OS[o], t);
+        E.sub(t, z, y);
+        cgbn_store(E.env, &OD[o], t);
+      }
+    }
+    E.padd_mem(WX, WY, WZ, WT, base, RX, RY, RZ, RT, base, RX, RY, RZ, RT, base + 1, &cur[C_A], &cur[C_D]);
+    return;
+  }
   typename T::bn_t a, d;
   cgbn_load(E.env, a, mp(&cur[C_A]));
   cgbn_load(E.env, d, mp(&cur[C_D]));
@@ -520,17 +565,7 @@ int batch_inverse(const cgbn_mem_t<BITS> *cur, uint32_t np0, const mpz_t n, cons
   return ret;
 }
 
-}  // namespace
-
 /* -------------------------------------------------------- RootGenerator */
-
-struct RootGenerator::Impl {
-  virtual ~Impl() {}
-  virtual int start(const RootPlanGPU &plan) = 0;
-  virtual int next_block(const RnsContext &ctx, uint32_t *out, mpz_t factor) = 0;
-};
-
-namespace {
 
 template <uint32_t TPI, uint32_t BITS>
 struct ImplT : RootGenerator::Impl {
@@ -567,7 +602,9 @@ struct ImplT : RootGenerator::Impl {
     const size_t all = ntab * nc;
     TX = dmalloc<mem_t>(all, s); TY = dmalloc<mem_t>(all, s); TT = dmalloc<mem_t>(all, s);
     mem_t *TZ = dmalloc<mem_t>(all, s), *TI = dmalloc<mem_t>(all, s);
-    k_pow2_chain<chain_tpi(BITS), BITS><<<(unsigned)nc, chain_tpi(BITS), 0, s>>>(cur, np0, W, ntab, TX, TY, TZ, TT);
+    for (int t0 = 0, cw = chain_windows(BITS); t0 < W; t0 += cw)
+      k_pow2_chain<chain_tpi(BITS), BITS><<<(unsigned)nc, chain_tpi(BITS), 0, s>>>(cur, np0, t0, std::min(W, t0 + cw),
+                                                                                  ntab, TX, TY, TZ, TT);
     for (int h = 1; h < WTAB; h *= 2) {
       const int jn = std::min(2 * h, WTAB) - h;
       k_table_round<TPI, BITS><<<grid_for((size_t)W * jn * nc, TPI), BLOCK, 0, s>>>(cur, np0, W, h, ntab, nc, TX, TY,
@@ -607,9 +644,21 @@ struct ImplT : RootGenerator::Impl {
     pl = &plan;
     const size_t nfd = plan.nprog * (plan.S + 1), all = nfd * nc;
     FX = dmalloc<mem_t>(all, s); FY = dmalloc<mem_t>(all, s); FZ = dmalloc<mem_t>(all, s); FT = dmalloc<mem_t>(all, s);
-    k_scalar_mul_tab<TPI, BITS><<<grid_for(all, TPI), BLOCK, 0, s>>>(cur, np0, plan.scal, plan.swords, plan.nbits,
-                                                                    nfd, nc, ntab, TX, TY, TT, FX, FY, FZ, FT);
-    CUDA_CHECK(cudaGetLastError());
+    {  /* in launches of at most mul_units(BITS) instance-windows: a range of
+          windows of all outputs, or of one window of a range of outputs */
+      const int W = (int)((plan.scalar_bits + WIN - 1) / WIN);
+      const size_t units = mul_units(BITS);
+      const int kw = (int)std::min<size_t>(W, std::max<size_t>(1, units / all));
+      const size_t per = kw > 1 || all <= units ? all : units;
+      for (int t0 = 0; t0 < W; t0 += kw)
+        for (size_t o0 = 0; o0 < all; o0 += per) {
+          const size_t n = std::min(per, all - o0);
+          k_scalar_mul_tab<TPI, BITS><<<grid_for(n, TPI), BLOCK, 0, s>>>(
+              cur, np0, plan.scal, plan.swords, plan.nbits, nfd, nc, ntab, o0, n, t0, std::min(W, t0 + kw), TX, TY,
+              TT, FX, FY, FZ, FT);
+          CUDA_CHECK(cudaGetLastError());
+        }
+    }
     /* the steps alternate between two copies of the tables */
     GX = dmalloc<mem_t>(all, s); GY = dmalloc<mem_t>(all, s); GZ = dmalloc<mem_t>(all, s); GT = dmalloc<mem_t>(all, s);
     for (auto pr : {std::make_pair(FX, GX), std::make_pair(FY, GY), std::make_pair(FZ, GZ), std::make_pair(FT, GT)})
@@ -815,11 +864,30 @@ void step_capacity(size_t *out) {
 
 }  // namespace
 
-#include "gpu/cgbn_sizes.h"
+/* the entry points for this size */
+template <>
+const RootsOps &roots_ops<GPUECM2_SIZE_BITS>() {
+  constexpr uint32_t B = GPUECM2_SIZE_BITS, T = GPUECM2_CGBN_TPI_FOR(GPUECM2_SIZE_BITS);
+  static const RootsOps ops = {make_impl<T, B>, step_capacity<T, B>, run_test_ops<T, B>, run_batch_inverse_test<T, B>};
+  return ops;
+}
+#else  // the public functions, dispatching to the size of the modulus
+
+namespace {
+const RootsOps &ops_for(size_t bits) {
+  const RootsOps *o = roots_ops_for(bits);
+  if (!o) {
+    fprintf(stderr, "modulus of %zu bits is too large (this build supports at most %d bits)\n", bits,
+            (int)GPUECM2_MAX_BITS);
+    exit(3);
+  }
+  return *o;
+}
+}  // namespace
 
 size_t root_step_capacity(size_t nbits) {
   size_t c = 0;
-  GPUECM2_CGBN_DISPATCH(nbits, step_capacity, &c);
+  ops_for(nbits).step_capacity(&c);
   return c;
 }
 
@@ -832,8 +900,7 @@ int RootGenerator::init(const MontgomeryCurve *C, size_t count, size_t maxbits, 
   failed_ = SIZE_MAX;
   int ret = ROOTS_ERROR;
   if (count == 0) return ret;
-  GPUECM2_CGBN_DISPATCH(mpz_sizeinbase(C[0].n.get(), 2), make_impl, &impl_, &ret, C, count, maxbits, factor, &failed_,
-                        s);
+  ops_for(mpz_sizeinbase(C[0].n.get(), 2)).make_impl(&impl_, &ret, C, count, maxbits, factor, &failed_, s);
   return ret;
 }
 
@@ -953,12 +1020,14 @@ int compute_roots(const RnsContext &ctx, const MontgomeryCurve &C, const Progres
 bool ec_test_ops(const MontgomeryCurve &C, const AffinePoint &P, const AffinePoint &Q, AffinePoint &R,
                  AffinePoint &D, AffinePoint &M) {
   bool ok = false;
-  GPUECM2_CGBN_DISPATCH(mpz_sizeinbase(C.n.get(), 2), run_test_ops, &ok, C, P, Q, R, D, M);
+  ops_for(mpz_sizeinbase(C.n.get(), 2)).test_ops(&ok, C, P, Q, R, D, M);
   return ok;
 }
 
 int batch_inverse_test(const mpz_t n, const std::vector<Z> &v, std::vector<Z> &inv, mpz_t factor) {
   int ret = ROOTS_ERROR;
-  GPUECM2_CGBN_DISPATCH(mpz_sizeinbase(n, 2), run_batch_inverse_test, &ret, n, &v, &inv, factor);
+  ops_for(mpz_sizeinbase(n, 2)).batch_inverse_test(&ret, n, &v, &inv, factor);
   return ret;
 }
+
+#endif  // GPUECM2_SIZE_BITS

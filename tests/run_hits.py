@@ -11,7 +11,8 @@ Usage: run_hits.py <gpuecm2> [hits-file] [-only regex] [-verbose] [gpuecm2 optio
 (gpuecm2 may also be tests/capi_resume, which runs stage 2 through the C interface)
 
 Line format (tab-separated; '#' starts a comment line):
-  B2 [or B2min-B2]  options (as for gpuecm2 and ecm, e.g. "-dickson 12")  factor  source  resume line
+  B2 [or B2min-B2, or "default": GMP-ECM's default B2]  options (as for gpuecm2 and ecm, e.g.
+  "-dickson 12")  factor  source  resume line
 The residues with the same parameters are run together (one gpuecm2 process
 per group, at most one residue per number in a process, so that a factor
 found on one curve cannot turn the next curve's number into a cofactor).
@@ -70,7 +71,8 @@ def main():
             with open(path, "w") as fh:
                 for h in hs:
                     fh.write(h["resume"] + "\n")
-            r = subprocess.run([gpu, "-v"] + list(popt) + extra + ["-resume", path, B1, B2],
+            bounds = [B1] if B2 == "default" else [B1, B2]
+            r = subprocess.run([gpu, "-v"] + list(popt) + extra + ["-resume", path] + bounds,
                                capture_output=True, text=True)
             blocks = re.split(r"(?=^Resuming ECM residue)", r.stdout, flags=re.M)[1:]
             # a build for smaller moduli only (-DGPUECM2_ONLY_BITS) refuses larger numbers

@@ -1,6 +1,7 @@
 /* Benchmark of a complete stage 2 (random curve and point) with GMP-ECM's
    parameters. N is an RSA challenge number (tests/data/rsa_numbers.txt), a
-   product of them ("RSA-2048*RSA-1024"), or a bit size (random RSA-like N).
+   product of them ("RSA-2048*RSA-1024"), a bit size (random RSA-like N), or
+   "@file": the N of the first line of a GMP-ECM resume file.
    Usage: bench_stage2 <N> <B1> [B2] [-power n | -dickson n] [-k n] [-maxmem MB] [-reps r] [-untimed 1] [-treecache 1]
                        [-batch b] [-spin 1]
    (-untimed: no synchronisation between phases; only the total is meaningful;
@@ -47,7 +48,16 @@ int main(int argc, char **argv) {
   gmp_randseed_ui(rs, 1);
   MontgomeryCurve E;
   const std::string nspec = argv[1];
-  if (nspec.compare(0, 4, "RSA-") == 0) {
+  if (nspec[0] == '@') {
+    std::ifstream in(nspec.substr(1));
+    std::string line;
+    std::getline(in, line);
+    const size_t a = line.find("N="), b = line.find(';', a);
+    if (a == std::string::npos || mpz_set_str(E.n.get(), line.substr(a + 2, b - a - 2).c_str(), 10) != 0) {
+      fprintf(stderr, "no N in %s\n", nspec.c_str() + 1);
+      return 1;
+    }
+  } else if (nspec.compare(0, 4, "RSA-") == 0) {
     mpz_set_ui(E.n.get(), 1);
     size_t pos = 0;
     while (pos <= nspec.size()) {
@@ -124,10 +134,12 @@ int main(int argc, char **argv) {
   printf("  total %.2f ms (best of %d)\n", t.total * per, reps);
   if (getenv("BENCH_MEM")) {  // peak of the stream-ordered pool (all allocations of stage 2 go there)
     cudaMemPool_t pool;
-    uint64_t used_hi = 0;
+    uint64_t used_hi = 0, res_hi = 0;
     if (cudaDeviceGetDefaultMemPool(&pool, 0) == cudaSuccess &&
-        cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemHigh, &used_hi) == cudaSuccess)
-      printf("  GPU memory pool peak %.0f MB (%ld curves)\n", used_hi / 1048576., batch);
+        cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemHigh, &used_hi) == cudaSuccess &&
+        cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemHigh, &res_hi) == cudaSuccess)
+      printf("  GPU memory pool peak %.0f MB (reserved %.0f MB), estimate %.0f MB (%ld curves)\n",
+             used_hi / 1048576., res_hi / 1048576., stage2_gpu_bytes(E.n.get(), sp, batch) / 1048576., batch);
   }
   return 0;
 }

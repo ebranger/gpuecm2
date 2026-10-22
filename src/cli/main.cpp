@@ -316,8 +316,14 @@ Job prepare(const ResumeRecord &orig, const NState &st, const Stage2Request &req
     if (rec.have_sigma) o.printf(", sigma=%d:%Zd\n", rec.param, rec.sigma.get());
     else o.printf(", A=%Zd\n", rec.A.get());
   }
-  if (verbose >= 2)
+  if (verbose >= 2) {
     o.printf("dF=%lu, k=%lu, d=%lu, d2=%lu, i0=%Zd\n", sp.dF, sp.k, sp.d1, sp.d2, sp.i0.get());
+    if (sp.dF && sp.k) {
+      const size_t one = stage2_gpu_bytes(rec.n, sp, 1), two = stage2_gpu_bytes(rec.n, sp, 2);
+      o.printf("GPU memory estimate %.1f MB for one curve, %.1f MB per further curve\n", one / 1048576.,
+               (two - one) / 1048576.);
+    }
+  }
 
   Z x(rec.x), y, a(J.A);
   mpz_set_ui(y, 1);

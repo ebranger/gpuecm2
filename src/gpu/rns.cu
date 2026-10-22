@@ -2,6 +2,7 @@
    This file is part of gpuecm2, distributed under the GNU Lesser General Public
    License, version 3 or later. See COPYING.LESSER and COPYING. */
 #include "gpu/rns.h"
+#include "gpu/rns_scratch.h"
 
 #include <algorithm>
 #include <cmath>
@@ -208,14 +209,14 @@ __device__ __forceinline__ void tile_mac(uint32_t (&lo)[TM][TN], uint32_t (&mid)
 template <int TM>
 __global__ void __launch_bounds__(GB_THREADS, TM == 4 ? 3 : 4) k_to_rns(const uint32_t *__restrict__ A, size_t ld, RowMap src_map,
                                                        size_t src_len, size_t piece_len, size_t npieces, size_t K,
-                                                       uint32_t *__restrict__ X, size_t xrows, size_t T,
-                                                       size_t dst_offset, bool reverse, RnsTables t) {
+                                                       size_t gbase, uint32_t *__restrict__ X, size_t xrows,
+                                                       size_t T, size_t dst_offset, bool reverse, RnsTables t) {
   constexpr int TN = 4, BM = 16 * TM, BN = 16 * TN;
   __shared__ uint32_t As[GB_K * (BM + 1)];
   __shared__ uint32_t Bs[GB_K * BN];
   __shared__ size_t src_sh[BN], dst_sh[BN];
   const int tid = threadIdx.x, tm = tid / 16, tn = tid % 16;
-  const size_t n0 = (size_t)blockIdx.x * BN;
+  const size_t n0 = gbase + (size_t)blockIdx.x * BN;
   const int m0 = blockIdx.y * BM, P = t.P, nl = t.nlimbs;
   if (tid < BN) {
     const size_t g = n0 + tid;
@@ -266,7 +267,7 @@ __global__ void __launch_bounds__(GB_THREADS, TM == 4 ? 3 : 4) k_to_rns(const ui
    y_q = x_q * (M/p_q)^-1 * scale mod p_q,  alpha = floor(sum y_q/p_q + 1/4) */
 template <int CB>
 __global__ void __launch_bounds__(CONV_THREADS) k_to_limbs_dot(const uint32_t *__restrict__ X, size_t rows, size_t T,
-                                                           size_t lo_i, size_t cnt, size_t K,
+                                                           size_t lo_i, size_t cnt, size_t K, size_t gbase,
                                                            uint32_t *__restrict__ Out, size_t ld, RowMap dst_map,
                                                            const uint32_t *__restrict__ cs,
                                                            const uint32_t *__restrict__ csp, RnsTables t) {
@@ -277,7 +278,7 @@ __global__ void __launch_bounds__(CONV_THREADS) k_to_limbs_dot(const uint32_t *_
   uint32_t *c1 = c0 + (size_t)W * CB;
   uint32_t *c2 = c1 + (size_t)W * CB;
   __shared__ uint32_t alpha_sh[CB];
-  const size_t g0 = (size_t)blockIdx.x * CB;
+  const size_t g0 = gbase + (size_t)blockIdx.x * CB;
 
   for (int idx = threadIdx.x; idx < P * CB; idx += CONV_THREADS) {
     int q = idx / CB, c = idx % CB;
@@ -383,20 +384,87 @@ size_t to_limbs_smem(int /*nl*/, int TM) {
   return (3 * BM * TG_N + (size_t)GB_K * (BM + 1) + (size_t)GB_K * TG_N) * 4 + 2 * TG_N * sizeof(size_t);
 }
 
+/* The end of an RNS -> limbs conversion for one coefficient, after its limbs
+   0 .. nl-1 have been written to out (stride ld) with the carry state of the
+   column sums (prev1, prev2, pc2, carry, carry2): the top three limbs, then
+   the reduction mod n. */
+__device__ __forceinline__ void to_limbs_finish(uint32_t *out, size_t ld, uint32_t prev1, uint32_t prev2, uint32_t pc2,
+                                                uint64_t carry, uint64_t carry2, const RnsTables &t) {
+  const int nl = t.nlimbs, W = nl + 3;
+  /* the top three limbs (j = nl .. nl+2) in registers */
+  uint32_t r[3];
+  for (int j = nl; j < W; j++) {
+    const uint64_t v1 = (uint64_t)prev1 + prev2 + carry;
+    carry = v1 >> 32;
+    const uint64_t v2 = (uint64_t)(uint32_t)v1 + carry2;
+    carry2 = v2 >> 32;
+    r[j - nl] = (uint32_t)v2;
+    prev1 = 0;
+    prev2 = pc2;
+    pc2 = 0;
+  }
+  auto limb = [&](int j) -> uint32_t { return j < nl ? out[(size_t)j * ld] : r[j - nl]; };
+  auto set = [&](int j, uint32_t v) {
+    if (j < nl) out[(size_t)j * ld] = v;
+    else r[j - nl] = v;
+  };
+  /* reduce mod n: q = the quotient estimated in double precision (exact but
+     for a value within about 2^-13 of an integer), v -= q n in one pass, then
+     add or subtract n until 0 <= v < n (normally one check) */
+  double tt = 0;
+  for (int j = W - 1; j >= nl - 2 && j >= 0; j--) tt = tt * 4294967296.0 + (double)limb(j);
+  if (nl >= 2) tt /= 4294967296.0;  // scale: v / 2^(32*(nl-1))
+  double qd = floor(tt / t.ntop);
+  if (qd < 0) qd = 0;
+  const uint64_t qq = (uint64_t)qd;  // < 2^53
+  int64_t br = 0;
+  if (qq) {
+    uint64_t cr = 0;
+    for (int j = 0; j < W; j++) {  // v -= qq * n
+      const uint64_t nj = j < nl ? t.n[j] : 0, plo = qq * nj, phi = __umul64hi(qq, nj);
+      const uint64_t s = plo + cr;
+      cr = ((phi + (s < plo)) << 32) | (s >> 32);
+      const int64_t sd = (int64_t)limb(j) - (uint32_t)s + br;
+      set(j, (uint32_t)sd);
+      br = sd >> 32;
+    }
+  }
+  for (int it = 0; it < 4 && br < 0; it++) {  // v < 0: add n
+    uint64_t c = 0;
+    for (int j = 0; j < W; j++) {
+      const uint64_t sm = (uint64_t)limb(j) + (j < nl ? t.n[j] : 0) + c;
+      set(j, (uint32_t)sm);
+      c = sm >> 32;
+    }
+    br = c ? 0 : -1;  // a carry out of the top limb: the sum wrapped to >= 0
+  }
+  for (int it = 0; it < 4; it++) {  // v >= n: subtract n
+    int64_t b = 0;
+    for (int j = 0; j < W; j++) b = ((int64_t)limb(j) - (j < nl ? t.n[j] : 0) + b) >> 32;
+    if (b < 0) break;
+    b = 0;
+    for (int j = 0; j < W; j++) {
+      const int64_t sd = (int64_t)limb(j) - (j < nl ? t.n[j] : 0) + b;
+      set(j, (uint32_t)sd);
+      b = sd >> 32;
+    }
+  }
+}
+
 template <int TM>
 __global__ void __launch_bounds__(GB_THREADS) k_to_limbs(const uint32_t *__restrict__ X, size_t rows, size_t T,
-                                                         size_t lo_i, size_t cnt, size_t K, uint32_t *Out,
+                                                         size_t lo_i, size_t cnt, size_t K, size_t gbase, uint32_t *Out,
                                                          size_t ld, RowMap dst_map, const uint32_t *__restrict__ cs,
                                                          const uint32_t *__restrict__ csp, RnsTables t) {
   constexpr int TN = 4, BM = 16 * TM, BN = TG_N;
   extern __shared__ uint32_t sh[];
-  const int P = t.P, nl = t.nlimbs, W = nl + 3;
+  const int P = t.P, nl = t.nlimbs;
   uint32_t *s0 = sh, *s1 = s0 + BM * BN, *s2 = s1 + BM * BN;  // [BM][BN] tile sums
   uint32_t *As = s2 + BM * BN, *Bs = As + GB_K * (BM + 1);
   size_t *col = (size_t *)(Bs + GB_K * BN);  // offset of coefficient n in a row of X, or SIZE_MAX
   size_t *outo = col + BN;                    // its position in Out
   const int tid = threadIdx.x, tm = tid / 16, tn = tid % 16;
-  const size_t n0 = (size_t)blockIdx.x * BN;
+  const size_t n0 = gbase + (size_t)blockIdx.x * BN;
   if (tid < BN) {
     const size_t g = n0 + tid, row = g / cnt;
     col[tid] = g < K ? row * T + lo_i + g % cnt : SIZE_MAX;
@@ -461,64 +529,96 @@ __global__ void __launch_bounds__(GB_THREADS) k_to_limbs(const uint32_t *__restr
     }
   }
   if (!mine) return;
-  /* the top three limbs (j = nl .. nl+2) in registers */
-  uint32_t r[3];
-  for (int j = nl; j < W; j++) {
-    const uint64_t v1 = (uint64_t)prev1 + prev2 + carry;
+  to_limbs_finish(out, ld, prev1, prev2, pc2, carry, carry2, t);
+}
+
+/* RNS -> limbs for large moduli, in two passes. In k_to_limbs each block runs
+   over the limb tiles one after the other and rereads its residues for each;
+   above about 12000 bits the residues of the blocks in flight no longer stay
+   in L2 between the tiles. Here k_to_limbs_sums computes the column sums of
+   one tile of 16 TM limbs for TG_N coefficients per block, the blocks of a
+   group of coefficients running together (the tile index varies fastest),
+   into S (lo, mid, hi words of limb j of coefficient n at S[(j, nl + j,
+   2 nl + j) * kn + n]); k_to_limbs_carry then adds them up per coefficient as
+   k_to_limbs does. */
+constexpr size_t TS_BYTES = RNS_TO_LIMBS_SCRATCH;  // the most scratch (S) per launch
+constexpr int TS_MIN_NL = 576;  // limbs from which the two passes are faster (18432 bits; equal at 16384)
+template <int TM>
+__global__ void __launch_bounds__(GB_THREADS) k_to_limbs_sums(const uint32_t *__restrict__ X, size_t rows, size_t T,
+                                                           size_t lo_i, size_t cnt, size_t K, size_t gbase,
+                                                           uint32_t *__restrict__ S, size_t kn,
+                                                           const uint32_t *__restrict__ cs,
+                                                           const uint32_t *__restrict__ csp, RnsTables t) {
+  constexpr int TN = 4, BM = 16 * TM, BN = TG_N;
+  __shared__ uint32_t As[GB_K * (BM + 1)];
+  __shared__ uint32_t Bs[GB_K * BN];
+  __shared__ size_t col[BN];  // offset of coefficient n in a row of X, or SIZE_MAX
+  const int P = t.P, nl = t.nlimbs, tid = threadIdx.x, tm = tid / 16, tn = tid % 16;
+  const int m0 = blockIdx.x * BM;
+  const size_t nloc0 = (size_t)blockIdx.y * BN, n0 = gbase + nloc0;
+  if (tid < BN) {
+    const size_t g = n0 + tid;
+    col[tid] = g < K ? (g / cnt) * T + lo_i + g % cnt : SIZE_MAX;
+  }
+  const size_t qstride = rows * T;
+  uint32_t lo[TM][TN] = {}, mid[TM][TN] = {}, hi[TM][TN] = {};
+  for (int k0 = 0; k0 < P; k0 += GB_K) {
+    __syncthreads();
+    for (int e = tid; e < GB_K * BM; e += GB_THREADS) {  // As[k][m] = Mi[k0+k][m0+m]
+      const int k = e / BM, m = e % BM;
+      As[k * (BM + 1) + m] = (k0 + k < P && m0 + m < nl) ? __ldg(t.Mi + (size_t)(k0 + k) * nl + m0 + m) : 0;
+    }
+    for (int e = tid; e < GB_K * BN; e += GB_THREADS) {  // Bs[k][n] = y_{k0+k} of coefficient n0+n
+      const int k = e / BN, n = e % BN, q = k0 + k;
+      const size_t o = col[n];
+      Bs[k * BN + n] = (q < P && o != SIZE_MAX) ? mul_shoup(X[(size_t)q * qstride + o], cs[q], csp[q], t.p[q]) : 0;
+    }
+    __syncthreads();
+#pragma unroll 4
+    for (int k = 0; k < GB_K; k++) tile_mac<TM, TN>(lo, mid, hi, As, BM + 1, Bs, BN, k, tm, tn);
+  }
+#pragma unroll
+  for (int i = 0; i < TM; i++)
+#pragma unroll
+    for (int jj = 0; jj < TN; jj++) {
+      const int j = m0 + tm + 16 * i;
+      const size_t n = nloc0 + tn + 16 * jj;
+      if (j < nl) {
+        S[(size_t)j * kn + n] = lo[i][jj];
+        S[(size_t)(nl + j) * kn + n] = mid[i][jj];
+        S[(size_t)(2 * nl + j) * kn + n] = hi[i][jj];
+      }
+    }
+}
+
+__global__ void __launch_bounds__(128) k_to_limbs_carry(const uint32_t *__restrict__ X, size_t rows, size_t T,
+                                                        size_t lo_i, size_t cnt, size_t K, size_t gbase,
+                                                        const uint32_t *__restrict__ S, size_t kn, uint32_t *Out,
+                                                        size_t ld, RowMap dst_map, const uint32_t *__restrict__ cs,
+                                                        const uint32_t *__restrict__ csp, RnsTables t) {
+  const size_t nloc = (size_t)blockIdx.x * blockDim.x + threadIdx.x, g = gbase + nloc;
+  if (g >= K || nloc >= kn) return;
+  const int P = t.P, nl = t.nlimbs;
+  const size_t row = g / cnt, o = row * T + lo_i + g % cnt, qstride = rows * T;
+  uint32_t *out = Out + dst_map(row) + (g - row * cnt);
+  /* alpha = floor(sum_q y_q v_q / 2^60 + 1/4), as in k_to_limbs */
+  uint32_t a = 0, b = 0, d = 0;
+  for (int q = 0; q < P; q++) mac96(a, b, d, mul_shoup(X[(size_t)q * qstride + o], cs[q], csp[q], t.p[q]), t.v[q]);
+  const uint64_t top = ((uint64_t)d << 32 | b) + (1u << 26);
+  const uint32_t al = (uint32_t)(top >> 28);
+  uint64_t carry = 0, carry2 = 0;
+  uint32_t prev1 = 0, prev2 = 0, pc2 = 0;
+  for (int j = 0; j < nl; j++) {
+    const uint64_t v1 = (uint64_t)S[(size_t)j * kn + nloc] + prev1 + prev2 + carry;
     carry = v1 >> 32;
-    const uint64_t v2 = (uint64_t)(uint32_t)v1 + carry2;
+    const uint64_t v2 = (uint64_t)(uint32_t)v1 + (uint64_t)al * t.nmM[j] + carry2;
     carry2 = v2 >> 32;
-    r[j - nl] = (uint32_t)v2;
-    prev1 = 0;
+    out[(size_t)j * ld] = (uint32_t)v2;
+    prev1 = S[(size_t)(nl + j) * kn + nloc];
     prev2 = pc2;
-    pc2 = 0;
+    pc2 = S[(size_t)(2 * nl + j) * kn + nloc];
   }
-  auto limb = [&](int j) -> uint32_t { return j < nl ? out[(size_t)j * ld] : r[j - nl]; };
-  auto set = [&](int j, uint32_t v) {
-    if (j < nl) out[(size_t)j * ld] = v;
-    else r[j - nl] = v;
-  };
-  /* reduce mod n: q = the quotient estimated in double precision (exact but
-     for a value within about 2^-13 of an integer), v -= q n in one pass, then
-     add or subtract n until 0 <= v < n (normally one check) */
-  double tt = 0;
-  for (int j = W - 1; j >= nl - 2 && j >= 0; j--) tt = tt * 4294967296.0 + (double)limb(j);
-  if (nl >= 2) tt /= 4294967296.0;  // scale: v / 2^(32*(nl-1))
-  double qd = floor(tt / t.ntop);
-  if (qd < 0) qd = 0;
-  const uint64_t qq = (uint64_t)qd;  // < 2^53
-  int64_t br = 0;
-  if (qq) {
-    uint64_t cr = 0;
-    for (int j = 0; j < W; j++) {  // v -= qq * n
-      const uint64_t nj = j < nl ? t.n[j] : 0, plo = qq * nj, phi = __umul64hi(qq, nj);
-      const uint64_t s = plo + cr;
-      cr = ((phi + (s < plo)) << 32) | (s >> 32);
-      const int64_t sd = (int64_t)limb(j) - (uint32_t)s + br;
-      set(j, (uint32_t)sd);
-      br = sd >> 32;
-    }
-  }
-  for (int it = 0; it < 4 && br < 0; it++) {  // v < 0: add n
-    uint64_t c = 0;
-    for (int j = 0; j < W; j++) {
-      const uint64_t sm = (uint64_t)limb(j) + (j < nl ? t.n[j] : 0) + c;
-      set(j, (uint32_t)sm);
-      c = sm >> 32;
-    }
-    br = c ? 0 : -1;  // a carry out of the top limb: the sum wrapped to >= 0
-  }
-  for (int it = 0; it < 4; it++) {  // v >= n: subtract n
-    int64_t b = 0;
-    for (int j = 0; j < W; j++) b = ((int64_t)limb(j) - (j < nl ? t.n[j] : 0) + b) >> 32;
-    if (b < 0) break;
-    b = 0;
-    for (int j = 0; j < W; j++) {
-      const int64_t sd = (int64_t)limb(j) - (j < nl ? t.n[j] : 0) + b;
-      set(j, (uint32_t)sd);
-      b = sd >> 32;
-    }
-  }
+  to_limbs_finish(out, ld, prev1, prev2, pc2, carry, carry2, t);
 }
 
 /* RNS -> limbs: exact CRT  x = sum y_q (M/p_q) - alpha M,
@@ -532,7 +632,7 @@ size_t to_limbs_cs_smem(int nl, int TM) {
 
 template <int TM>
 __global__ void __launch_bounds__(GB_THREADS) k_to_limbs_cs(const uint32_t *__restrict__ X, size_t rows, size_t T,
-                                                         size_t lo_i, size_t cnt, size_t K,
+                                                         size_t lo_i, size_t cnt, size_t K, size_t gbase,
                                                          uint32_t *__restrict__ Out, size_t ld, RowMap dst_map,
                                                          const uint32_t *__restrict__ cs,
                                                          const uint32_t *__restrict__ csp, RnsTables t) {
@@ -543,7 +643,7 @@ __global__ void __launch_bounds__(GB_THREADS) k_to_limbs_cs(const uint32_t *__re
   uint32_t *As = c2 + (size_t)nl * BN, *Bs = As + GB_K * (BM + 1);
   size_t *col = (size_t *)(Bs + GB_K * BN);  // offset of coefficient n in a row of X, or SIZE_MAX
   const int tid = threadIdx.x, tm = tid / 16, tn = tid % 16;
-  const size_t n0 = (size_t)blockIdx.x * BN;
+  const size_t n0 = gbase + (size_t)blockIdx.x * BN;
   if (tid < BN) {
     const size_t g = n0 + tid;
     col[tid] = g < K ? (g / cnt) * T + lo_i + g % cnt : SIZE_MAX;
@@ -668,6 +768,21 @@ __global__ void k_pad(uint32_t *__restrict__ X, size_t xrows, size_t T, size_t o
 
 /* rows per thread (TM = 2, 3 or 4) for a matrix product with `rows` rows:
    little padding of the last tile, more rows per thread (fewer loads) */
+/* Coefficients per conversion launch: about 2^35 / (P nl) products of residues by
+   constants, about 30 ms on an RTX 4070 Ti SUPER, so that kernels stay short at
+   large moduli (one launch up to 700000 coefficients at 4608 bits, 15000 at 32768);
+   with GPUECM2_SPLIT_LAUNCHES=1 (testing aid) 64 */
+size_t conv_slice(int P, int nl) {
+  static const bool split = getenv("GPUECM2_SPLIT_LAUNCHES") != nullptr;
+  const size_t s = ((size_t)1 << 35) / ((size_t)P * nl);
+  return split ? 64 : std::max<size_t>(4096, s / 64 * 64);
+}
+/* K coefficients in launches of at most `most`: equal slices (multiples of 64) */
+size_t balanced_slice(size_t K, size_t most) {
+  const size_t n = (K + most - 1) / most;
+  return std::min(most, ((K + n - 1) / n + 63) / 64 * 64);
+}
+
 int choose_tm(int rows) {
   int best = 4;
   double best_cost = 1e30;
@@ -697,15 +812,19 @@ void RnsContext::from_limbs_map(const uint32_t *A, size_t ld, const RowMap &src,
   }
   if (K == 0) return;
   const int tm = choose_tm(t_.P);
-  const dim3 grid((unsigned)((K + 63) / 64), (unsigned)((t_.P + 16 * tm - 1) / (16 * tm)));
+  const size_t slice = balanced_slice(K, conv_slice(t_.P, t_.nlimbs));
+  for (size_t g0 = 0; g0 < K; g0 += slice) {
+    const size_t k = std::min(slice, K - g0);
+    const dim3 grid((unsigned)((k + 63) / 64), (unsigned)((t_.P + 16 * tm - 1) / (16 * tm)));
 #define GPUECM2_TO_RNS(TM)                                                                                          \
-  k_to_rns<TM><<<grid, GB_THREADS, 0, s>>>(A, ld, src, src_len, piece_len, npieces, K, X, xrows, T, dst_offset,   \
+  k_to_rns<TM><<<grid, GB_THREADS, 0, s>>>(A, ld, src, src_len, piece_len, npieces, K, g0, X, xrows, T, dst_offset, \
                                            reverse, t_)
-  if (tm == 4) GPUECM2_TO_RNS(4);
-  else if (tm == 3) GPUECM2_TO_RNS(3);
-  else GPUECM2_TO_RNS(2);
+    if (tm == 4) GPUECM2_TO_RNS(4);
+    else if (tm == 3) GPUECM2_TO_RNS(3);
+    else GPUECM2_TO_RNS(2);
 #undef GPUECM2_TO_RNS
-  CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaGetLastError());
+  }
   if (lead_in_data) add_const(X, xrows, T, (size_t)lead_pos, lead_c, s);  // after the data is written
 }
 
@@ -724,45 +843,68 @@ void RnsContext::to_limbs_map(const uint32_t *X, size_t rows, size_t T, size_t l
   int tmg = 2;  // rows per thread for k_to_limbs: 2 or 3, whichever wastes less of the last tile
   if ((nl + 47) / 48 * 48 * 3 < (nl + 31) / 32 * 32 * 4) tmg = 3;
   const size_t smem_cs = to_limbs_cs_smem(nl, tm), smem = to_limbs_smem(nl, tmg);
-  int kind = nl < 32 ? 0 : nl > 32 && nl <= 48 && smem_cs <= 48 * 1024 ? 1 : 2;  // 0 dot, 1 column sums, 2 per tile
+  /* 0 dot, 1 column sums, 2 per tile, 3 per tile in two passes */
+  int kind = nl < 32 ? 0 : nl > 32 && nl <= 48 && smem_cs <= 48 * 1024 ? 1 : nl < TS_MIN_NL ? 2 : 3;
   if (const char *e = getenv("GPUECM2_TO_LIMBS"))
-    kind = !strcmp(e, "dot") ? 0 : !strcmp(e, "cs") && smem_cs <= 64 * 1024 ? 1 : 2;
-  if (kind == 1) {
-    const unsigned grid = (unsigned)((K + TL_N - 1) / TL_N);
-#define GPUECM2_TO_LIMBS_CS(TM)                                                                                     \
-  do {                                                                                                              \
-    if (smem_cs > 48 * 1024)                                                                                        \
-      CUDA_CHECK(cudaFuncSetAttribute(k_to_limbs_cs<TM>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_cs)); \
-    k_to_limbs_cs<TM><<<grid, GB_THREADS, smem_cs, s>>>(X, rows, T, lo, cnt, K, Out, ld, dst, cs, csp, t_);          \
-  } while (0)
-    if (tm == 4) GPUECM2_TO_LIMBS_CS(4);
-    else if (tm == 3) GPUECM2_TO_LIMBS_CS(3);
-    else GPUECM2_TO_LIMBS_CS(2);
-#undef GPUECM2_TO_LIMBS_CS
-  } else if (kind == 2) {
-    const unsigned grid = (unsigned)((K + TG_N - 1) / TG_N);
-#define GPUECM2_TO_LIMBS_G(TM)                                                                                      \
-  do {                                                                                                              \
-    if (smem > 48 * 1024)                                                                                           \
-      CUDA_CHECK(cudaFuncSetAttribute(k_to_limbs<TM>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));     \
-    k_to_limbs<TM><<<grid, GB_THREADS, smem, s>>>(X, rows, T, lo, cnt, K, Out, ld, dst, cs, csp, t_);              \
-  } while (0)
-    if (tmg == 3) GPUECM2_TO_LIMBS_G(3);
-    else GPUECM2_TO_LIMBS_G(2);
-#undef GPUECM2_TO_LIMBS_G
-  } else {
-    const size_t limit = 46 * 1024;
-    if (to_limbs_dot_smem<32>(P, nl) <= limit)
-      k_to_limbs_dot<32><<<(unsigned)((K + 31) / 32), CONV_THREADS, to_limbs_dot_smem<32>(P, nl), s>>>(
-          X, rows, T, lo, cnt, K, Out, ld, dst, cs, csp, t_);
-    else if (to_limbs_dot_smem<16>(P, nl) <= limit)
-      k_to_limbs_dot<16><<<(unsigned)((K + 15) / 16), CONV_THREADS, to_limbs_dot_smem<16>(P, nl), s>>>(
-          X, rows, T, lo, cnt, K, Out, ld, dst, cs, csp, t_);
-    else
-      k_to_limbs_dot<8><<<(unsigned)((K + 7) / 8), CONV_THREADS, to_limbs_dot_smem<8>(P, nl), s>>>(
-          X, rows, T, lo, cnt, K, Out, ld, dst, cs, csp, t_);
+    kind = !strcmp(e, "dot") ? 0 : !strcmp(e, "cs") && smem_cs <= 64 * 1024 ? 1 : !strcmp(e, "split") ? 3 : 2;
+  if (kind == 3) {
+    const size_t kmax = std::min(conv_slice(P, nl), TS_BYTES / (12 * (size_t)nl)) / TG_N * TG_N;
+    const size_t kn = balanced_slice(K, std::max<size_t>(TG_N, kmax));
+    uint32_t *S;
+    CUDA_CHECK(cudaMallocAsync(&S, 12 * (size_t)nl * kn, s));
+    for (size_t g0 = 0; g0 < K; g0 += kn) {
+      const size_t k = std::min(kn, K - g0);
+      const dim3 grid((unsigned)((nl + 16 * tmg - 1) / (16 * tmg)), (unsigned)((k + TG_N - 1) / TG_N));
+      if (tmg == 3) k_to_limbs_sums<3><<<grid, GB_THREADS, 0, s>>>(X, rows, T, lo, cnt, K, g0, S, kn, cs, csp, t_);
+      else k_to_limbs_sums<2><<<grid, GB_THREADS, 0, s>>>(X, rows, T, lo, cnt, K, g0, S, kn, cs, csp, t_);
+      CUDA_CHECK(cudaGetLastError());
+      k_to_limbs_carry<<<(unsigned)((k + 127) / 128), 128, 0, s>>>(X, rows, T, lo, cnt, K, g0, S, kn, Out, ld, dst, cs,
+                                                                   csp, t_);
+      CUDA_CHECK(cudaGetLastError());
+    }
+    CUDA_CHECK(cudaFreeAsync(S, s));
+    return;
   }
-  CUDA_CHECK(cudaGetLastError());
+  const size_t slice = balanced_slice(K, conv_slice(P, nl));
+  for (size_t g0 = 0; g0 < K; g0 += slice) {
+    const size_t k = std::min(slice, K - g0);
+    if (kind == 1) {
+      const unsigned grid = (unsigned)((k + TL_N - 1) / TL_N);
+#define GPUECM2_TO_LIMBS_CS(TM)                                                                                       \
+  do {                                                                                                                \
+    if (smem_cs > 48 * 1024)                                                                                          \
+      CUDA_CHECK(cudaFuncSetAttribute(k_to_limbs_cs<TM>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_cs)); \
+    k_to_limbs_cs<TM><<<grid, GB_THREADS, smem_cs, s>>>(X, rows, T, lo, cnt, K, g0, Out, ld, dst, cs, csp, t_);       \
+  } while (0)
+      if (tm == 4) GPUECM2_TO_LIMBS_CS(4);
+      else if (tm == 3) GPUECM2_TO_LIMBS_CS(3);
+      else GPUECM2_TO_LIMBS_CS(2);
+#undef GPUECM2_TO_LIMBS_CS
+    } else if (kind == 2) {
+      const unsigned grid = (unsigned)((k + TG_N - 1) / TG_N);
+#define GPUECM2_TO_LIMBS_G(TM)                                                                                        \
+  do {                                                                                                                \
+    if (smem > 48 * 1024)                                                                                             \
+      CUDA_CHECK(cudaFuncSetAttribute(k_to_limbs<TM>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));       \
+    k_to_limbs<TM><<<grid, GB_THREADS, smem, s>>>(X, rows, T, lo, cnt, K, g0, Out, ld, dst, cs, csp, t_);           \
+  } while (0)
+      if (tmg == 3) GPUECM2_TO_LIMBS_G(3);
+      else GPUECM2_TO_LIMBS_G(2);
+#undef GPUECM2_TO_LIMBS_G
+    } else {
+      const size_t limit = 46 * 1024;
+      if (to_limbs_dot_smem<32>(P, nl) <= limit)
+        k_to_limbs_dot<32><<<(unsigned)((k + 31) / 32), CONV_THREADS, to_limbs_dot_smem<32>(P, nl), s>>>(
+            X, rows, T, lo, cnt, K, g0, Out, ld, dst, cs, csp, t_);
+      else if (to_limbs_dot_smem<16>(P, nl) <= limit)
+        k_to_limbs_dot<16><<<(unsigned)((k + 15) / 16), CONV_THREADS, to_limbs_dot_smem<16>(P, nl), s>>>(
+            X, rows, T, lo, cnt, K, g0, Out, ld, dst, cs, csp, t_);
+      else
+        k_to_limbs_dot<8><<<(unsigned)((k + 7) / 8), CONV_THREADS, to_limbs_dot_smem<8>(P, nl), s>>>(
+            X, rows, T, lo, cnt, K, g0, Out, ld, dst, cs, csp, t_);
+    }
+    CUDA_CHECK(cudaGetLastError());
+  }
 }
 
 namespace {

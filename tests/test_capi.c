@@ -90,7 +90,7 @@ int main(void) {
   }
 
   /* refused inputs */
-  mpz_mul_2exp(fac, n, 4600); mpz_add_ui(fac, fac, 1);
+  mpz_mul_2exp(fac, n, 32800); mpz_add_ui(fac, fac, 1);  /* above the largest size (32768 bits) */
   CHECK(gpuecm2_stage2_new(fac, p, err, sizeof err) == NULL && strstr(err, "at most") != NULL);
   CHECK(gpuecm2_choose_params(p, expect, 10000, NULL, NULL, 0, 0, 0, 1, err, sizeof err) == 0);  /* odd n is fine */
   mpz_set_ui(fac, 1000);

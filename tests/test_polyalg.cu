@@ -218,6 +218,8 @@ int main(int argc, char **argv) {
   run(64, 100, 20);
   run(2048, 77, 20);
   run(4400, 50, 20);
+  run(16000, 100, 20);
+  run(32768, 40, 20);
   run(1024, 1000, 20);
   run(1024, 3000, 12);  // fallback products (Tmax = 4096)
   run(2048, 2500, 12);
@@ -228,6 +230,7 @@ int main(int argc, char **argv) {
     run(1024, 65536, 20);
     run(2048, 36864, 20);   // GMP-ECM's dF for 2048-bit N, B1 = 11e6
     run(4400, 5000, 20);
+    run(32768, 3000, 20);
     run(1024, 131072, 20);
   }
   printf("%s (%d failures)\n", failures ? "FAIL" : "OK", failures);

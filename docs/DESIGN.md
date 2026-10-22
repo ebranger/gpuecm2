@@ -11,8 +11,9 @@ GMP-ECM's CPU stage 2.
   Same default B2 for a given B1, same output lines and exit codes.
 - **Input:** GMP-ECM resume files (`METHOD=ECM`, PARAM 0–3 and generic A/X Montgomery curves).
   N may be an expression.
-- **Size:** N up to 4608 bits (the largest CGBN size used). Larger N would need more or larger
-  NTT primes (64-bit primes) and larger CGBN sizes.
+- **Size:** N up to 32768 bits, CGBN's largest size (it supports at most TPI = 32 threads of
+  TPI limbs each). Larger N would need another big-number arithmetic for the roots and
+  products, and more or larger NTT primes (64-bit primes) for long polynomials.
 - **Hardware:** NVIDIA, compute capability 7.5+ (Turing and newer); must build with CUDA 12 and 13.
   Keep code HIP-portable where cheap.
 - **OS:** Linux first. Host code must also build with MSVC (Windows): CMake, no `__int128`,
@@ -85,13 +86,34 @@ The C interface is shaped so that GMP-ECM can call it from its per-curve stage 2
     one tile of sums whatever the size of N. For 33–48 limbs (1025–1536 bits) a variant that
     keeps the column sums of all limbs is faster, below 32 limbs one dot product per thread.
     2.1 ns per coefficient at 1024 bits, 5.8 at 2048, 22 at 4096, 25 at 4608.
+    From 576 limbs (18432 bits) on, two passes: one block per tile of output limbs and
+    group of coefficients (the tile index varying fastest, so that the blocks reading the same
+    residues run together), the column sums to a scratch buffer, then one thread per
+    coefficient for the carries and the reduction. With one block running over all tiles the
+    residues of the blocks in flight no longer stay in L2 above about 12000 bits (L2 hit rate
+    39% at 32768 bits against 91% at 12288), and the one-dimensional grid has few blocks when
+    dF is small: the two passes are 25% faster in the conversion itself at 24576-32768 bits
+    (1.1 µs instead of 1.46 µs per coefficient at 32768) and up to 44% faster in the whole
+    stage 2 at small dF (32251 bits, B1 = 1e5).
     `bench/bench_conv` measures both directions.
+  - Kernels are kept short (tens of ms; Windows' watchdog, a display on the GPU) at large
+    sizes: the conversions run in slices of about 2^35 / (P nl) coefficients, the doubling
+    chain of the fixed-base tables and the fixed-base multiplications in ranges of windows
+    (at 32768 bits a single launch of the chain took 140 ms with S = 3, and grows with the
+    scalar size). Smaller sizes are not split in practice.
   - Tried and rejected (M6): the same products as int8 tensor-core GEMMs (bytes of limbs ×
     bytes of constants, exact in int32). With the short inner dimension (4 × limbs) a WMMA
     kernel reached only 13–22 T MAC/s, no faster than the CUDA-core kernels.
 - **EC arithmetic for roots:** CGBN behind a thin wrapper, sizes in steps of 256 bits up to
-  2048 and 512 above (TPI 4 at 512 bits, 8 up to 1792 and at 3072, 16 otherwise; chosen
-  by measurement). A modulus of exactly BITS bits uses that size.
+  2048, 512 up to 4608, then 1024 up to 8192, 2048 up to 16384 and 4096 up to 32768 (TPI 4
+  at 512 bits, 8 up to 1792 and at 3072, 16 up to 8192, 32 above; chosen by measurement up
+  to 8192 bits, above that TPI 32 is the only choice). A modulus of exactly BITS bits uses
+  that size. Each size is compiled in its own translation unit (`gen/roots_<BITS>.cu`,
+  `gen/prod_<BITS>.cu`, see `src/gpu/cgbn_ops.h`), so the sizes compile in parallel.
+  - Above 4608 bits the point addition of the progressions (`k_step`) takes its operands
+    from memory where they are used (`padd_mem`): two points and the curve constants no
+    longer fit in registers (255 registers and 0.4-1.9 KB of spills per thread from 8192
+    bits up, none with `padd_mem` up to 16384 bits); 1-3% faster in the whole stage 2.
   - The curve is GMP-ECM's Montgomery curve, used in its twisted Edwards form
     (a = (A+2)/B, d = (A−2)/B) in extended coordinates: dedicated addition (9M + 1 product
     by a) with the unified formula as fallback, 1.4–2.4× cheaper than projective
@@ -180,8 +202,8 @@ arithmetic; none of them is implemented.
 ## Robustness and limits
 
 - Kernels run ≲ 100 ms each, to stay under the Windows TDR and display watchdogs.
-- Sizes: moduli up to 4608 bits (the largest CGBN size; a residue of a larger number is
-  skipped with a message). No limit on B2 or B2min: the G plan works with offsets from i0,
+- Sizes: moduli up to 32768 bits, or the largest size the build has (`GPUECM2_MAX_BITS`); a
+  residue of a larger number is skipped with a message. No limit on B2 or B2min: the G plan works with offsets from i0,
   and memory is O(dF) on the GPU and O(progressions) on the host whatever k is (tested
   against GMP-ECM with B2min-B2 ranges up to 1e39, and with self-checked runs up to
   k = 2240 blocks).
@@ -221,7 +243,8 @@ arithmetic; none of them is implemented.
 | M5 | End-to-end stage 2 and CLI. Differential tests against GMP-ECM: the same curves must find factors in step 2, over N sizes 200–4400 bits and default B2 for B1 from 1e4 to 3e9. Memory auto-sizing and self-check. **Done:** end-to-end results match GMP-ECM exactly on every curve tested, and the 10 logged real hits are reproduced. GPU memory planning raises k when needed, and GMP-ECM's multi-line resume semantics are implemented. Optional `-selfcheck` (off by default; injected faults are caught, see `test_stage2`). |
 | M6 | Performance: curve batching for small dF, streams/overlap, tuning, benchmarks against the CPU, a HIP-portability dry run. **Done:** Edwards root arithmetic, per-step kernel, CGBN size ladder, G roots per block, plan and memory-pool tuning, stream overlap, curve batching. Stage 2 is 1.6–2.7× faster than at the end of M5 for one curve (see the table below), and up to 50× for small B1 with batching; 100–200× one CPU core at GMP-ECM's default parameters (docs/BENCHMARKS.md). |
 | M7 | Library and tests for publication: C interface (`gpuecm2.h`, `libgpuecm2`), known stage 2 hits from real factoring work, boundary tests at every size and parameter threshold, large-B2 robustness (closed-form G plans). **Done**; see docs/TESTING.md and docs/INTEGRATION.md. |
-| M8 | Integration into GMP-ECM (a patch using the C interface in `cudawrapper.c` and `ecm.c`). Not started. |
+| M8 | Integration into GMP-ECM (a patch using the C interface in `cudawrapper.c` and `ecm.c`). **Done:** `gmp-ecm/` (option `-gpu2`, `build_ecm.sh`, `test_gpu2.py`). |
+| M9 | Large moduli, step 1: up to 32768 bits (CGBN's limit) in the current design, gpuecm2 and GMP-ECM's GPU stage 1 (more kernel sizes only). **Done:** CGBN sizes per translation unit (`GPUECM2_MAX_BITS`), a memory estimate from the allocations, kernels split for the watchdog, a two-pass RNS-to-limbs conversion and memory operands in `k_step` for large sizes; tests up to 32768 bits against GMP-ECM (boundary tests, `tests/large_tests.py`, 40 stage 2 hits of repunit cofactors). Stage 2 is 80-190 times one CPU core from B1 = 1e5 (docs/BENCHMARKS.md). |
 
 ### M6 benchmarks (idle RTX 4070 Ti SUPER)
 

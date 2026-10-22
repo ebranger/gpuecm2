@@ -139,6 +139,46 @@ For larger B2 the time grows less than proportionally: 4 times GMP-ECM's default
 (B1 = 3e6 and 43e6; measured before the optimisation). Where GMP-ECM's dF does not fit in the GPU memory (4608 bits at
 16 times the default for B1 = 43e6) gpuecm2 uses a smaller dF with more blocks.
 
+## Large numbers (4609 to 32768 bits)
+
+Stage 2 per curve at GMP-ECM's default B2 for numbers of 8192 to 32768 bits (the residues
+of `tests/large_tests.py prepare`, B1 as for the residue): GMP-ECM 7.0.6 on one core of the
+i7-14700F (run alone), gpuecm2 on one curve and with the automatic batch size (in
+parentheses: 2^17 / dF curves, or as many as the GPU memory holds), and GMP-ECM's GPU
+stage 1 per curve (`-gpu` with the kernels of
+`gmp-ecm/0002-cgbn-kernel-sizes.patch`, a full batch of 4224 curves; measured at B1 = 1e4
+on numbers of 7679, 15870, 24060 and 32251 bits, which use the 8192- to 32768-bit kernels,
+and scaled linearly in B1, marked ≈):
+
+| N bits | B1 | B2 | dF, k | GPU stage 1 | CPU stage 2 | GPU stage 2 | GPU, batched | speedup | speedup, batched |
+|---|---|---|---|---|---|---|---|---|---|
+| 8192 | 1e4 | 1 678 960 | 288, 2 | 1.5 ms | 385 ms | 62 ms | 3.4 ms (455) | 6 | 113 |
+| 8192 | 1e5 | 35 857 930 | 1344, 2 | ≈15 ms | 2.91 s | 87 ms | 17 ms (97) | 34 | 172 |
+| 8192 | 1e6 | 974 637 522 | 6720, 2 | ≈152 ms | 19.06 s | 163 ms | 103 ms (19) | 117 | 184 |
+| 8192 | 3e6 | 4 592 487 916 | 14400, 2 | ≈456 ms | 54.49 s | 353 ms | 298 ms (9) | 154 | 183 |
+| 8192 | 11e6 | 30 114 149 530 | 36864, 2 | ≈1.67 s | 203.82 s | 1.10 s | 1.06 s (3) | 185 | 193 |
+| 16384 | 1e4 | 1 678 960 | 288, 2 | 5.8 ms | 1.09 s | 173 ms | 12 ms (255) | 6 | 93 |
+| 16384 | 1e5 | 35 857 930 | 1344, 2 | ≈58 ms | 7.36 s | 265 ms | 61 ms (72) | 28 | 121 |
+| 16384 | 1e6 | 974 637 522 | 6720, 2 | ≈580 ms | 48.50 s | 522 ms | 353 ms (14) | 93 | 137 |
+| 16384 | 3e6 | 4 592 487 916 | 14400, 2 | ≈1.74 s | 139.22 s | 1.18 s | 1.05 s (6) | 118 | 133 |
+| 24576 | 1e4 | 1 678 960 | 288, 2 | 12 ms | 1.85 s | 163 ms | 23 ms (191) | 11 | 80 |
+| 24576 | 1e5 | 35 857 930 | 1344, 2 | ≈124 ms | 12.64 s | 308 ms | 122 ms (40) | 41 | 103 |
+| 24576 | 1e6 | 974 637 522 | 6720, 2 | ≈1.24 s | 83.17 s | 896 ms | 759 ms (10) | 93 | 110 |
+| 32768 | 1e4 | 1 678 960 | 288, 2 | 22 ms | 2.83 s | 258 ms | 41 ms (143) | 11 | 69 |
+| 32768 | 1e5 | 35 857 930 | 1344, 2 | ≈220 ms | 18.86 s | 505 ms | 227 ms (30) | 37 | 83 |
+| 32768 | 1e6 | 974 637 522 | 6720, 2 | ≈2.20 s | 123.20 s | 1.55 s | 1.26 s (7) | 79 | 98 |
+
+The speedup is smaller than below 4608 bits (69-193 times batched, against 105-240 times):
+the conversions between residues mod N and the RNS take time proportional to the square of
+the size of N, while GMP-ECM's polynomial arithmetic grows more slowly. At 32768 bits and
+B1 = 1e6 the time goes to the roots of F and G (44%, curve arithmetic with 32 limbs per
+thread), the trees, 1/F and products mod F (39%) and the evaluation (16%), and within the
+polynomial arithmetic mostly to the conversions; the NTTs themselves are a few percent. GPU stage 1 then takes about 1.7 times as long as GPU stage 2.
+
+Batching pays more at large N than below, also for larger dF: at 32251 bits, B1 = 1e4 takes
+274 ms for one curve, 99 ms per curve for 4 and 50 ms for 16; B1 = 1e5 532, 273 and 224 ms.
+`-treecache` gains nothing at these sizes (8188 and 16376 bits, B1 = 1e6).
+
 ## Stage 1 and stage 2 on the same GPU
 
 GMP-ECM 7.0.6's GPU stage 1 (`ecm -gpu`, CGBN, parametrization 3, 4224 curves per run) on

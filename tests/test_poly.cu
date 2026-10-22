@@ -156,7 +156,7 @@ int main(int argc, char **argv) {
   bool quick = argc > 1 && strcmp(argv[1], "--quick") == 0;
   gmp_randinit_default(rs);
   gmp_randseed_ui(rs, 2026);
-  for (int bits : {30, 64, 200, 1023, 1024, 1500, 2048, 3000, 4400}) test_roundtrip(bits);
+  for (int bits : {30, 64, 200, 1023, 1024, 1500, 2048, 3000, 4400, 8192, 16000, 32768}) test_roundtrip(bits);
 
   const size_t small[][2] = {{1, 1}, {1, 5}, {2, 2}, {3, 7}, {17, 33}, {63, 2}, {64, 64}, {65, 100}, {200, 300}};
   for (int bits : {64, 1024, 2048, 4400})
@@ -165,12 +165,15 @@ int main(int argc, char **argv) {
   test_mul(1024, 3000, 2500, 2, 12, true);                   // split, Tmax 4096
   test_mul(1024, 5000, 5000, 2, 14, false);                  // four-step 2^14
   test_mul(4400, 3000, 3000, 1, 12, false);                  // split at 4400 bits
+  test_mul(16000, 3000, 2000, 1, 16, false);
+  test_mul(32768, 1000, 1000, 1, 16, false);
   if (!quick) {
     test_mul(1024, 1 << 16, 1 << 16, 1, 17, false);          // four-step 2^17
     test_mul(1024, 1 << 17, 1 << 17, 1, 16, false);          // split into 4 pieces each
     test_mul(1024, (1 << 17) + 12345, 777, 1, 18, false);    // unbalanced
     test_mul(2048, 100000, 100000, 1, 18, false);
     test_mul(4400, 1 << 15, 1 << 15, 1, 16, false);
+    test_mul(32768, 1 << 14, 1 << 14, 1, 16, false);
   }
   printf("%s (%d failures)\n", failures ? "FAIL" : "OK", failures);
   return failures != 0;

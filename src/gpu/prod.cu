@@ -3,12 +3,16 @@
    License, version 3 or later. See COPYING.LESSER and COPYING. */
 #include "gpu/prod.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 
-#include "gpu/cuda_check.h"
-#include "gpu/cgbn_sizes.h"
-#include "gpu/ecc.cuh"
+#include "gpu/cgbn_ops.h"
 #include "host/mpz_class_lite.h"
+
+#ifdef GPUECM2_SIZE_BITS  // compiled once per CGBN size, in prod_<BITS>.cu (see gpu/cgbn_ops.h)
+#include "gpu/cuda_check.h"
+#include "gpu/ecc.cuh"
 
 namespace {
 
@@ -244,14 +248,35 @@ void run_roots_value(const RnsContext &ctx, const mpz_t n, const uint32_t *roots
 
 }  // namespace
 
+/* the entry points for this size */
+template <>
+const ProdOps &prod_ops<GPUECM2_SIZE_BITS>() {
+  constexpr uint32_t B = GPUECM2_SIZE_BITS, T = GPUECM2_CGBN_TPI_FOR(GPUECM2_SIZE_BITS);
+  static const ProdOps ops = {run<T, B>, run_poly_value<T, B>, run_roots_value<T, B>};
+  return ops;
+}
+#else  // the public functions, dispatching to the size of the modulus
+
+namespace {
+const ProdOps &ops_for(size_t bits) {
+  const ProdOps *o = prod_ops_for(bits);
+  if (!o) {
+    fprintf(stderr, "modulus of %zu bits is too large (this build supports at most %d bits)\n", bits,
+            (int)GPUECM2_MAX_BITS);
+    exit(3);
+  }
+  return *o;
+}
+}  // namespace
+
 void poly_value(const RnsContext &ctx, const mpz_t n, const uint32_t *coef, size_t ld, size_t len, bool monic,
                 const mpz_t x, mpz_t out, cudaStream_t s) {
-  GPUECM2_CGBN_DISPATCH(mpz_sizeinbase(n, 2), run_poly_value, ctx, n, coef, ld, len, monic, x, out, s);
+  ops_for(mpz_sizeinbase(n, 2)).poly_value(ctx, n, coef, ld, len, monic, x, out, s);
 }
 
 void roots_value(const RnsContext &ctx, const mpz_t n, const uint32_t *roots, size_t ld, size_t len,
                  const mpz_srcptr *r, int nr, mpz_ptr *out, cudaStream_t s) {
-  GPUECM2_CGBN_DISPATCH(mpz_sizeinbase(n, 2), run_roots_value, ctx, n, roots, ld, len, r, nr, out, s);
+  ops_for(mpz_sizeinbase(n, 2)).roots_value(ctx, n, roots, ld, len, r, nr, out, s);
 }
 
 void product_gcd(const RnsContext &ctx, const mpz_t n, const uint32_t *V, size_t count, mpz_t g, cudaStream_t s) {
@@ -269,5 +294,7 @@ void product_gcd_batch(const RnsContext &ctx, const mpz_t n, const uint32_t *V, 
     }
     return;
   }
-  GPUECM2_CGBN_DISPATCH(mpz_sizeinbase(n, 2), run, ctx, n, V, count, batch, g, s, prod);
+  ops_for(mpz_sizeinbase(n, 2)).product(ctx, n, V, count, batch, g, s, prod);
 }
+
+#endif  // GPUECM2_SIZE_BITS

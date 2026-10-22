@@ -140,6 +140,59 @@ struct EcEnv {
     mul(R.T, e, h);
   }
 
+  /* padd<false> for the large sizes, where two points and the constants do
+     not fit in registers (with them k_step spilled 0.4-1.9 KB per thread from
+     8192 bits up): P (at ip in PX..PT), Q (at iq in QX..QT) and a, d are loaded
+     from memory where they are used, R's coordinates are stored (at ir in
+     RX..RT) as they are computed. The same operations as padd, in an order with
+     fewer live values (at most 8 besides n), so the same result. */
+  __device__ __forceinline__ void ld(bn_t &r, const mem_t *p, size_t i) { cgbn_load(env, r, const_cast<mem_t *>(p + i)); }
+  __device__ __forceinline__ void padd_mem(mem_t *RX, mem_t *RY, mem_t *RZ, mem_t *RT, size_t ir, const mem_t *PX,
+                                           const mem_t *PY, const mem_t *PZ, const mem_t *PT, size_t ip,
+                                           const mem_t *QX, const mem_t *QY, const mem_t *QZ, const mem_t *QT,
+                                           size_t iq, const mem_t *am, const mem_t *dm) {
+    bn_t e, f, g, h, m1, m2, u, v;
+    /* dedicated formula (add_dedicated) */
+    ld(u, PZ, ip); ld(v, QT, iq); mul(m1, u, v);  // C = Z1 T2
+    ld(u, PT, ip); ld(v, QZ, iq); mul(m2, u, v);  // D = T1 Z2
+    add(e, m2, m1);                               // E = D + C
+    sub(h, m2, m1);                               // H = D - C
+    ld(u, PX, ip); ld(v, QX, iq); mul(m1, u, v);  // A = X1 X2
+    ld(v, PY, ip); sub(f, u, v);                  // X1 - Y1
+    ld(u, QY, iq); mul(m2, v, u);                 // B = Y1 Y2
+    ld(v, QX, iq); add(g, v, u);                  // X2 + Y2
+    mul(f, f, g);
+    add(f, f, m2);
+    sub(f, f, m1);                                // F = (X1 - Y1)(X2 + Y2) + B - A
+    ld(u, am, 0); mul(m1, u, m1);
+    add(g, m2, m1);                               // G = B + a A
+    mul(u, f, g);
+    if (is_zero(u)) {  /* unified formula (add_unified) */
+      ld(u, PX, ip); ld(v, QX, iq); mul(m1, u, v);  // A = X1 X2
+      ld(g, PY, ip); add(e, u, g);                  // X1 + Y1
+      ld(h, QY, iq); add(f, v, h);                  // X2 + Y2
+      mul(m2, g, h);                                // B = Y1 Y2
+      mul(e, e, f);
+      sub(e, e, m1);
+      sub(e, e, m2);                                // E = (X1 + Y1)(X2 + Y2) - A - B
+      ld(u, PT, ip); ld(v, QT, iq); mul(u, u, v);
+      ld(v, dm, 0); mul(u, u, v);                   // C = d T1 T2
+      ld(v, PZ, ip); ld(g, QZ, iq); mul(v, v, g);   // D = Z1 Z2
+      sub(f, v, u);                                 // F = D - C
+      add(g, v, u);                                 // G = D + C
+      ld(v, am, 0); mul(m1, v, m1);
+      sub(h, m2, m1);                               // H = B - a A
+      mul(u, f, g);
+    }
+    cgbn_store(env, RZ + ir, u);
+    mul(u, e, f);
+    cgbn_store(env, RX + ir, u);
+    mul(u, g, h);
+    cgbn_store(env, RY + ir, u);
+    mul(u, e, h);
+    cgbn_store(env, RT + ir, u);
+  }
+
   /* R = 2P ("dbl-2008-hwcd", 4M + 4S + 1 product by a) */
   __device__ void pdbl(Pt &R, const Pt &P, const bn_t &a) {
     bn_t A, B, C, D, e, f, g, h;

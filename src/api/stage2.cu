@@ -12,10 +12,12 @@
 #include <cstdlib>
 #include <vector>
 
+#include "gpu/cgbn_sizes.h"
 #include "gpu/cuda_check.h"
 #include "gpu/limbops.h"
 #include "gpu/polyalg.h"
 #include "gpu/prod.h"
+#include "gpu/rns_scratch.h"
 
 namespace {
 double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -113,29 +115,39 @@ size_t nprog_target(int S_, size_t count, double vmax, size_t cap, size_t batch)
   }
   return target;
 }
-size_t cgbn_bits(size_t bits) {  // see gpu/cgbn_sizes.h
-  size_t cgbn = 512;
-  while (cgbn < bits) cgbn += cgbn < 2048 ? 256 : 512;
-  return cgbn;
-}
 }  // namespace
 
 void stage2_cpu_wait(bool spin) {
   cudaSetDeviceFlags(spin ? cudaDeviceScheduleSpin : cudaDeviceScheduleBlockingSync);
 }
 
+/* The peak is reached while G is processed block by block, with the root
+   generation of the next block running concurrently. */
 size_t stage2_gpu_bytes(const mpz_t n, const Stage2Params &sp, size_t batch) {
   const size_t bits = mpz_sizeinbase(n, 2), nl4 = 4 * ((bits + 31) / 32), dF = sp.dF, B = batch;
+  if (dF == 0) return (size_t)256 << 20;
   const size_t P = (2 * bits + clog2(2 * dF + 2) + 2) / 30 + 2;
-  const size_t cgbn = cgbn_bits(bits);
+  const size_t mem = std::max<size_t>(cgbn_size_for(bits), bits) / 8;  // one CGBN value
   const size_t L = clog2(dF), T2 = (size_t)1 << clog2(2 * dF);
-  size_t b = nl4 * dF * (L + 2 + 4);          // tree, F, I, Gb, G, H, V
-  b += 7 * (cgbn / 8) * dF;                   // root generation temporaries (output ring, inverses)
-  b += 4 * P * 2 * T2;                        // cached transforms of F and 1/F
-  b *= B;
-  b += std::max<size_t>((size_t)768 << 20, 4 * P * 3 * T2 * B);  // transient products
-  b += 8 * (cgbn / 8) * 9 * 16384;            // progression tables (about 8 waves)
-  return b + ((size_t)256 << 20);
+  const size_t a = nl4 * dF, r = 4 * P * T2;  // per curve: a polynomial, a transform of length T2
+  /* polynomials: the product tree, F, 1/F, two blocks of roots of G, G, H, V;
+     the transforms of F and 1/F; transient products (up to 3 transforms, 4 polynomials) */
+  size_t per = (L + 7) * a + 2 * r + 3 * r + 4 * a;
+  /* root generation: the output ring and the batch inversion (about 7 values
+     per root), the fixed-base tables (63 points per 6 bits of the largest
+     scalar, about S log2(vmax) bits) and the progressions' difference tables
+     (8 copies of S+1 values; at least one progression per residue mod d2) */
+  const unsigned long S = (unsigned long)std::abs(sp.S);
+  const double vmax = std::max(2.0 * dF * sp.d1 / eulerphi(sp.d1) * sp.d2,
+                               (std::fabs(mpz_get_d(sp.i0.get())) + (double)sp.k * dF * sp.d2 / eulerphi(sp.d2)) * sp.d1);
+  const size_t sbits = (size_t)(S * (std::log2(std::max(vmax, 2.0)) + 2)) + 8;
+  per += mem * (7 * dF + 3 * 63 * ((sbits + 5) / 6) + 8 * (S + 1) * (sp.d2 + 1));
+  /* and the progressions that fill the GPU (nprog_target: up to 8 waves of additions) */
+  int ndev = 0;
+  const size_t cap = cudaGetDeviceCount(&ndev) == cudaSuccess && ndev > 0 ? root_step_capacity(bits) : 16384;
+  const size_t waves = 8 * mem * 8 * cap * (S + 1) / std::max<unsigned long>(S, 1);
+  /* the scratch of the conversions (large moduli), and a margin */
+  return per * B + waves + RNS_TO_LIMBS_SCRATCH + ((size_t)256 << 20);
 }
 
 size_t stage2_gpu_budget() {

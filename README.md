@@ -6,12 +6,14 @@ NVIDIA GPU. It reads the residues that GMP-ECM saves after stage 1 (`ecm -save`,
 exactly GMP-ECM's stage 2 parameters, covers the same primes, and finds the same factors.
 For every curve tested, its results agree with GMP-ECM's bit for bit (including GMP-ECM's
 internal "Product of G(f_i)" value), and it finds again 1461 stage 2 factors from logs of real
-factoring work.
+factoring work, and 40 more on repunit cofactors of 4625 to 31309 bits. Numbers of up to
+32768 bits are supported.
 
 On an RTX 4070 Ti SUPER a stage 2 at GMP-ECM's default parameters takes 160–240 times less
 time than GMP-ECM on one core of an i7-14700F, for numbers of 512 to 4096 bits and B1 from
 3e6 up (e.g. 12 ms instead of 2.3 s for a 1024-bit number at B1 = 3e6, 3.3 s instead of 655 s
-for 4096 bits at B1 = 11e7); see [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+for 4096 bits at B1 = 11e7), and 80–190 times less for numbers of 8192 to 32768 bits from
+B1 = 1e5 (e.g. 1.3 s instead of 123 s for 32768 bits at B1 = 1e6); see [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 For a 1024-bit number and the B1 values from GMP-ECM's table (with GMP-ECM's
 default B2), on an RTX 4070 Ti SUPER and one core of an i7-14700F the following timings were
@@ -85,7 +87,8 @@ The options mean what they mean for `ecm` (stage 2 only). In addition:
 - While the GPU works the CPU thread sleeps, so all cores stay available for CPU stage 1;
   `-spin` busy-waits instead (no measurable speed difference on the test system).
 
-Limits: odd numbers of up to 4608 bits (other residues are skipped with a message); any B2
+Limits: odd numbers of up to 32768 bits, or the `GPUECM2_MAX_BITS` of the build (other residues
+are skipped with a message); any B2
 (B2 and B2min may exceed 2^64); parametrizations 0–3 and curves given by A (not GMP-ECM's
 `-torsion` curves). Improper options or bounds are refused before anything runs, and
 unusable resume lines are skipped with a message (docs/TESTING.md).
@@ -109,9 +112,14 @@ cd build && ctest
 cmake --install build --prefix /usr/local   # gpuecm2, libgpuecm2.so, gpuecm2.h
 ```
 
-Compiling the CGBN kernels for all twelve modulus sizes (512 to 4608 bits) takes about seven
-minutes. For development, `-DGPUECM2_ONLY_BITS=1024` builds a single size (moduli up to 1024 bits)
-in about a minute.
+The CGBN kernels are compiled for 24 modulus sizes, 512 to 32768 bits. The large sizes take
+long: about 50 minutes for all of them with `-j 2` (100 minutes of CPU time; the 32768-bit size
+alone takes 24 minutes and 9 GB of memory, the 28672-bit one 16 minutes and 6.4 GB), against
+7 minutes for the sizes up to 4608 bits. `-DGPUECM2_MAX_BITS=b` compiles the sizes up to b bits
+only (moduli up to b bits): 4608 takes 7 minutes, 8192 about 12, 16384 about 20. `-j 2` needs
+up to about 11 GB of memory with all sizes; with less, use `-j 1` (9 GB) or a lower
+`GPUECM2_MAX_BITS`. For development, `-DGPUECM2_ONLY_BITS=1024`
+builds a single size (moduli up to 1024 bits) in about a minute.
 
 On Windows, use the MSVC toolchain with GMP from vcpkg (`-DGMP_ROOT=...`); the library is then
 built as a static library.
@@ -129,8 +137,10 @@ python3 gmp-ecm/test_gpu2.py                # checks it against GMP-ECM's CPU st
 
 `build_ecm.sh` downloads the GMP-ECM 7.0.6 release, checks its checksum, applies the patches in
 `gmp-ecm/` and builds `ecm` with GPU support for the GPU in the machine (`--arch NN` for
-another compute capability, `--gpuecm2 DIR` for an installed gpuecm2, `--no-kernel-sizes` to
-leave GMP-ECM's GPU stage 1 kernels as they are; see [gmp-ecm/README.md](gmp-ecm/README.md)).
+another compute capability, `--gpuecm2 DIR` for an installed gpuecm2, `--max-bits B` to compile
+the GPU stage 1 kernels up to B bits only, `--no-kernel-sizes` to leave GMP-ECM's GPU stage 1
+kernels as they are; see [gmp-ecm/README.md](gmp-ecm/README.md)). With all kernels the build
+takes about 16 minutes.
 The patches are under the GPL, like GMP-ECM; see that file.
 
 Usage is that of GMP-ECM's `-gpu` with one more option:
@@ -149,7 +159,7 @@ echo "<number>" | build-gmp-ecm/ecm-7.0.6/ecm -gpu2 [-gpucurves n] [-sigma 3:s] 
   chooses with the smallest larger `-k` that fits (more, smaller blocks covering the same B2),
   with a message, as the standalone `gpuecm2` does. If gpuecm2 cannot run the stage 2 at all,
   GMP-ECM's CPU stage 2 is used, with a message.
-- With the kernel-size patch, numbers of up to 4602 bits can use GPU stage 1 (GMP-ECM 7.0.6
+- With the kernel-size patch, numbers of up to 32762 bits can use GPU stage 1 (GMP-ECM 7.0.6
   alone stops at 4090 bits); `ECM_CGBN_BITS=b` forces the stage 1 kernel of b bits.
 
 Stage 1 and stage 2 run one after the other: on a GPU both keep it fully busy, and running
@@ -161,7 +171,10 @@ them concurrently was measured to be slower (docs/BENCHMARKS.md).
 
 - `ctest`: unit tests of every part, including the C interface (about a minute).
 - `python3 tests/run_hits.py build/gpuecm2`: known stage 2 factors from real factoring work
-  (`tests/data/stage2_hits.txt`) must be found again; no GMP-ECM needed.
+  (`tests/data/stage2_hits.txt`, and `tests/data/stage2_hits_large.txt` for 4609 to 32768
+  bits) must be found again; no GMP-ECM needed.
+- `tests/large_tests.py`: comparisons with GMP-ECM above 4608 bits on residues and GMP-ECM
+  results computed once (`prepare`, hours of CPU time) and kept in a cache directory.
 - With a GMP-ECM binary: `tests/boundary_tests.py` compares both programs on both sides of
   every size and parameter threshold; `tests/compare_stage2.py`, `tests/compare_params.py`,
   `tests/check_curves.py` and `test_roots <ecm>` compare curves, parameters and roots.

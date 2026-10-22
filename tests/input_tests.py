@@ -12,6 +12,8 @@ Usage: input_tests.py <gpuecm2> [-v]
 Needs a GPU only for the few cases that run a (tiny) stage 2.
 """
 import os, re, subprocess, sys, tempfile
+if hasattr(sys, "set_int_max_str_digits"):  # numbers of up to 32768 bits (9865 digits)
+    sys.set_int_max_str_digits(0)
 
 GOOD_N = 1522605027922533360535618378132637429718068114961380688657908494580122963258952897654000350692006139  # RSA-100
 # a residue of RSA-100 (any point will do for these tests; the CHECKSUM is computed below)
@@ -84,7 +86,7 @@ CASES = [
     ("N negative", [], [with_(N="-15")], "10000", None, "skip"),
     ("N even", [], [with_(N=str(2 * GOOD_N))], "10000", None, "skip"),
     ("N bad expression", [], [with_(N="10^(")], "10000", None, "skip"),
-    ("N over 4608 bits", [], [with_(N=str(2 ** 4700 + 1))], "10000", None, "skip"),
+    ("N over 32768 bits", [], [with_(N=str(2 ** 32800 + 1))], "10000", None, "skip"),
     ("B1 field nan", [], [with_(B1="nan")], "10000", None, "skip"),
     ("B1 field inf", [], [with_(B1="inf")], "10000", None, "skip"),
     ("B1 field negative", [], [with_(B1="-5")], "10000", None, "skip"),

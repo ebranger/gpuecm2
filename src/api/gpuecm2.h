@@ -79,7 +79,8 @@ int gpuecm2_choose_params(gpuecm2_params p, const mpz_t n, double B1, const mpz_
 
 typedef struct gpuecm2_stage2 gpuecm2_stage2;
 
-/* An engine for modulus n (odd, at most 4608 bits) and parameters p.
+/* An engine for modulus n (odd, at most 32768 bits, or the GPUECM2_MAX_BITS the library was
+   built with) and parameters p.
    Returns NULL with a message in err if that is not possible. */
 gpuecm2_stage2 *gpuecm2_stage2_new(const mpz_t n, const gpuecm2_params p, char *err, size_t errlen);
 void gpuecm2_stage2_free(gpuecm2_stage2 *s);

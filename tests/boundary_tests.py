@@ -4,13 +4,14 @@ parameter value where gpuecm2 switches between code paths, and gpuecm2 against
 itself where only a hidden choice changes (batch size, NTT length, memory).
 
 Thresholds covered (see docs/TESTING.md):
-  - modulus sizes: the CGBN size ladder (512, 768, ..., 2048, 2560, ..., 4608
-    bits) and one bit more, 32-bit limb counts, GMP-ECM's NTT threshold
+  - modulus sizes: the CGBN size ladder (512, 768, ..., 2048, 2560, ..., 4608,
+    5120, ..., 8192, 10240, ..., 16384, 20480, ..., 32768 bits) and one bit
+    more, 32-bit limb counts, GMP-ECM's NTT threshold
     (1920 bits: power-of-two dF or not), the kernels of the RNS->limbs
     conversion (tiled from 993 to 3552 bits, otherwise one dot product per
     thread with CB 32/16/8, switching at 2254-2258 and 4577 bits), sizes where the RNS
-    primes leave no spare bit over the CRT bound, tiny moduli and 4608 bits
-    (the largest supported; 4609 bits must be refused);
+    primes leave no spare bit over the CRT bound, tiny moduli and 32768 bits
+    (the largest supported; 32769 bits must be refused);
   - the NTT length: products longer than the longest NTT use the split and
     exact-product paths; at small sizes forced with GPUECM2_MAX_LOGT, at their
     natural size switches with --heavy (dF = 2^21 at 483/484 bits, 2^20 at
@@ -31,6 +32,8 @@ Usage: boundary_tests.py <gpuecm2> <ecm> [--heavy] [--cache DIR] [--only REGEX] 
 GMP-ECM runs one at a time with a memory cap (4 GB; 10 GB for --heavy).
 """
 import argparse, os, random, re, resource, subprocess, sys, time
+if hasattr(sys, "set_int_max_str_digits"):  # numbers of up to 32768 bits (9865 digits)
+    sys.set_int_max_str_digits(0)
 
 B1 = "10000"
 
@@ -54,18 +57,21 @@ def is_prime(n):
 
 def number(bits, tag=0):
     """A product of two primes with exactly `bits` bits, close to 2^bits (so
-    that the CRT bounds are as tight as they get); deterministic."""
+    that the CRT bounds are as tight as they get); deterministic. Above 4608
+    bits a product of primes of about 1024 bits (large primes take long to find)."""
     rnd = random.Random(bits * 1009 + tag)
     if bits < 40:
         raise ValueError("too small")
-    a = bits // 2
-    b = bits - a
+    m = 2 if bits <= 4608 else bits // 1024
+    sizes = [bits // m + (i < bits % m) for i in range(m)]
     while True:
         def prime_near_top(k):
             while True:
                 x = rnd.getrandbits(k) | (0xff << (k - 8)) | 1
                 if is_prime(x): return x
-        n = prime_near_top(a) * prime_near_top(b)
+        n = 1
+        for k in sizes:
+            n *= prime_near_top(k)
         if n.bit_length() == bits:
             return n
 
@@ -121,32 +127,6 @@ def b2_for_dF(dF, k, po2):
             if (best_dF(B2, k, po2) or 0) > dF: break
     return None
 
-# gpuecm2's GPU memory estimate (stage2_gpu_bytes in src/api/stage2.cu)
-def rns_primes_count(bits, dF):
-    need = 2 * bits + clog2(2 * dF + 2) + 2
-    for k in range(max(12, clog2(2 * dF)), 11, -1):
-        bitsM, P = 0.0, 0
-        c = ((1 << 31) - 1) >> k
-        while c >= 1 and ((c << k) + 1) >= (1 << 28):
-            if is_prime((c << k) + 1):
-                import math
-                bitsM += math.log2((c << k) + 1); P += 1
-                if bitsM >= need - 1: return P
-            c -= 1
-    return None
-
-def gpu_bytes(bits, dF, B=1):
-    nl4 = 4 * ((bits + 31) // 32)
-    P = (2 * bits + clog2(2 * dF + 2) + 2) // 30 + 2
-    cg = 512
-    while cg < bits: cg += 256 if cg < 2048 else 512
-    L, T2 = clog2(dF), 1 << clog2(2 * dF)
-    b = nl4 * dF * (L + 2 + 4) + 7 * (cg // 8) * dF + 4 * P * 2 * T2
-    b *= B
-    b += max(768 << 20, 4 * P * 3 * T2 * B)
-    b += 8 * (cg // 8) * 9 * 16384
-    return b + (256 << 20)
-
 # ---------------------------------------------------------------- running
 class Runner:
     def __init__(self, gpu, ecm, cache, memcap):
@@ -196,6 +176,12 @@ class Runner:
                            capture_output=True, text=True, env=e)
         return self.outcomes(r.stdout), r
 
+def estimate(R, save, b2, opts=()):
+    """gpuecm2's GPU memory estimate in MB (stage2_gpu_bytes): (one curve, each further curve)"""
+    _, r = R.run_gpu(save, b2, opts, {"GPUECM2_PARAMS_ONLY": "1", "GPUECM2_GPU_MEM": "1e9"})
+    m = re.search(r"GPU memory estimate ([\d.]+) MB for one curve, ([\d.]+) MB per further curve", r.stdout)
+    return float(m.group(1)), float(m.group(2))
+
 def params_line(text):
     m = re.search(r"dF=(\d+), k=(\d+), d=(\d+), d2=(\d+), i0=(-?\d+)", text)
     return m.groups() if m else None
@@ -208,14 +194,16 @@ def cases(heavy):
     # modulus sizes (dF = 256 at the default B2 for B1 = 1e4)
     sizes = [64, 100, 256, 487, 490, 511, 512, 513, 767, 768, 769, 992, 993, 1014, 1017, 1023, 1024, 1025, 1280, 1281,
              1536, 1537, 1792, 1793, 1912, 1916, 1920, 1921, 2048, 2049, 2253, 2254, 2257, 2258, 2560, 2561,
-             3072, 3073, 3552, 3553, 3584, 3585, 4008, 4032, 4096, 4097, 4504, 4527, 4576, 4577, 4607, 4608]
+             3072, 3073, 3552, 3553, 3584, 3585, 4008, 4032, 4096, 4097, 4504, 4527, 4576, 4577, 4607, 4608,
+             4609, 5120, 5121, 6144, 6145, 7168, 7169, 8192, 8193, 10240, 10241, 12288, 12289, 14336, 14337,
+             16384, 16385, 20480, 20481, 24576, 24577, 28672, 28673, 32767, 32768]
     for bits in sizes:
         add(f"size/{bits}", lambda R, bits=bits: compare(R, R.residues(bits, 2), "1873422"))
     # larger polynomials (dF = 16384) at the sizes where the conversions switch tiles
     for bits in (512, 992, 993, 1920, 1921, 2254, 2258, 3552, 3553, 4576, 4577, 4608):
         add(f"size-dF16384/{bits}", lambda R, bits=bits: compare(R, R.residues(bits, 1), "5706890290",
                                                                 ["-dickson", "6"]))
-    add("size/4609-refused", lambda R: refused(R, R.residues(4609, 1), "1873422"))
+    add("size/32769-refused", lambda R: refused(R, R.residues(32769, 1), "1873422"))
 
     # Brent-Suyama polynomials
     for opt in (["-power", "1"], ["-power", "2"], ["-power", "3"], ["-power", "6"], ["-power", "7"],
@@ -256,16 +244,28 @@ def cases(heavy):
     add("batch/1024-dF16384", lambda R: batches(R, R.residues(1024, 12), "5706890290", [1, 5, 0, 12],
                                                 ["-dickson", "6"]))
     # a budget that holds about 40 curves of dF = 256 (the automatic batch is 512)
-    budget = (gpu_bytes(1024, 256, 40) >> 20) + 1
-    add("batch/budget-cut", lambda R: batches(R, R.residues(1024, 520), "1873422", [0, 512],
-                                              env={"GPUECM2_GPU_MEM": str(budget)}, expect_batches_max=40))
-    # a budget below what dF = 16384 needs, above dF = 8192
-    budget2 = ((gpu_bytes(1024, 16384) + gpu_bytes(1024, 8192)) >> 21)
-    add("memory/more-blocks", lambda R: more_blocks(R, R.residues(1024, 1), "5706890290", str(budget2)))
+    def budget_cut(R):
+        save = R.residues(1024, 520)
+        one, per = estimate(R, save, "1873422")
+        return batches(R, save, "1873422", [0, 512], env={"GPUECM2_GPU_MEM": str(one + 39.5 * per)},
+                       expect_batches_max=40)
+    add("batch/budget-cut", budget_cut)
+    # a budget just below what GMP-ECM's dF = 16384 needs
+    def more_blocks_case(R):
+        save = R.residues(1024, 1)
+        one, _ = estimate(R, save, "5706890290", ["-dickson", "6"])
+        return more_blocks(R, save, "5706890290", str(one - 1))
+    add("memory/more-blocks", more_blocks_case)
 
     if heavy:
         add("heavy/b2-512-1e13", lambda R: compare(R, R.residues(512, 1), "10000000000000", selfcheck=True))
         add("heavy/b2-2048-1e12", lambda R: compare(R, R.residues(2048, 1), "1000000000000", selfcheck=True))
+        # large moduli with larger polynomials, also with split products
+        for bits in (8193, 16385):
+            add(f"heavy/size-dF16384/{bits}", lambda R, bits=bits: compare(R, R.residues(bits, 1), "5706890290",
+                                                                          ["-dickson", "6"]))
+        add("heavy/maxlogt/8193/12", lambda R: compare(R, R.residues(8193, 1), "5706890290", ["-dickson", "6"],
+                                                       env={"GPUECM2_MAX_LOGT": "12"}))
         # natural NTT length switches: (bits, B2 giving the wanted dF with k = 2)
         for bits, dF in ((483, 1 << 21), (484, 1 << 21), (1186, 1 << 20), (1187, 1 << 20),
                          (2520, 362880), (2521, 362880)):

@@ -2,6 +2,7 @@
    back, the matrix products that dominate the polynomial arithmetic for large
    moduli), with a round-trip check.
    Usage: bench_conv [bits ...]   (default 512 1024 2048 3072 4096 4608) */
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -33,7 +34,9 @@ int main(int argc, char **argv) {
     const size_t dF = 1 << 15;
     if (!ctx.init(n, 2 * dF + 2, 16, &err)) { printf("%s\n", err.c_str()); return 1; }
     const int nl = ctx.nlimbs(), P = ctx.P();
-    const size_t T = (size_t)1 << 16, rows = 8, K = rows * T;  // 2^19 coefficients
+    /* 2^19 coefficients, fewer for large moduli (at most 2^28 residues) */
+    const size_t T = (size_t)1 << 16, rows = std::max<size_t>(1, std::min<size_t>(8, ((size_t)1 << 28) / ((size_t)P * T)));
+    const size_t K = rows * T;
     std::vector<uint32_t> h((size_t)nl * K);
     for (size_t g = 0; g < K; g++) {  // random residues < n
       mpz_t x;

@@ -12,6 +12,7 @@
 
 #include <gmp.h>
 
+#include "gpu/cgbn_sizes.h"
 #include "gpu/cuda_check.h"
 #include "gpu/roots.h"
 #include "api/stage2.h"
@@ -19,6 +20,7 @@
 #include "host/params.h"
 #include "host/resume.h"
 #include "host/roots_plan.h"
+#include "random_number.h"
 
 static int failures = 0;
 static gmp_randstate_t rs;
@@ -46,10 +48,10 @@ static AffPt aff_add(const AffPt &P, const AffPt &Q, const mpz_t a, const mpz_t 
 }
 
 static void test_formulas(int bits) {
-  /* random Montgomery curve and point mod a prime, and GMP-ECM's Weierstrass model of it */
+  /* random Montgomery curve and point mod a prime (above 4608 bits a product of
+     large primes), and GMP-ECM's Weierstrass model of it */
   MontgomeryCurve C;
-  mpz_urandomb(C.n.get(), rs, bits); mpz_setbit(C.n.get(), bits - 1);
-  mpz_nextprime(C.n.get(), C.n.get());
+  random_hard_number(C.n.get(), rs, bits);
   mpz_urandomm(C.A.get(), rs, C.n.get());
   mpz_urandomm(C.u.get(), rs, C.n.get());
   Z fac, a, B, t;
@@ -82,7 +84,7 @@ static void test_formulas(int bits) {
                       r && !same(D, D2) ? "dbl " : "", r && !same(M, S) ? "mixed" : "");
     ok &= good;
   }
-  printf("%s curve formulas, %d-bit prime modulus\n", ok ? "ok  " : "FAIL", bits);
+  printf("%s curve formulas, %d-bit %s modulus\n", ok ? "ok  " : "FAIL", bits, bits <= 4608 ? "prime" : "hard");
   failures += !ok;
 }
 
@@ -92,8 +94,8 @@ static void test_formulas(int bits) {
    other by q) in the same chunk or the same higher-level product. */
 static void test_batch_inverse(int bits) {
   Z p, q, n, f, t;
-  mpz_urandomb(p, rs, bits / 2); mpz_setbit(p, bits / 2 - 1); mpz_nextprime(p, p);
-  mpz_urandomb(q, rs, bits - bits / 2); mpz_setbit(q, bits - bits / 2 - 1); mpz_nextprime(q, q);
+  random_hard_number(p, rs, bits / 2);
+  random_hard_number(q, rs, bits - bits / 2);
   mpz_mul(n, p, q);
   bool ok = true;
   for (size_t count : {20, 64, 300, 5000}) {  // host only; one, two, three GPU levels (chunks of 8)
@@ -155,12 +157,13 @@ static void test_roots_vs_ecm(const char *ecm, const char *nstr, int param, unsi
   const std::string tmp = "/tmp/gpuecm2_test_roots_" + std::to_string(getpid()) + ".txt";
   const std::string lim = "ulimit -v 2000000; ";
   remove(tmp.c_str());
-  char cmd[4096];
-  snprintf(cmd, sizeof cmd, "%secho %s | %s -q -param %d -sigma %d:%lu -save %s %.0f 1 > /dev/null 2>&1", lim.c_str(),
-           nstr, ecm, param, param, sigma, tmp.c_str(), B1);
-  run_cmd(cmd);
-  snprintf(cmd, sizeof cmd, "%s%s -v -v -v -v -v %s -resume %s %.0f %s 2>&1", lim.c_str(), ecm, sopt, tmp.c_str(), B1, B2);
-  std::string trace = run_cmd(cmd);
+  std::vector<char> cmd(strlen(nstr) + 4096);
+  snprintf(cmd.data(), cmd.size(), "%secho %s | %s -q -param %d -sigma %d:%lu -save %s %.0f 1 > /dev/null 2>&1",
+           lim.c_str(), nstr, ecm, param, param, sigma, tmp.c_str(), B1);
+  run_cmd(cmd.data());
+  snprintf(cmd.data(), cmd.size(), "%s%s -v -v -v -v -v %s -resume %s %.0f %s 2>&1", lim.c_str(), ecm, sopt,
+           tmp.c_str(), B1, B2);
+  std::string trace = run_cmd(cmd.data());
   /* GMP-ECM's roots: f_i, and g_i per block (index restarts each block) */
   std::vector<std::string> fv, gv;
   for (size_t pos = 0; pos < trace.size();) {
@@ -308,16 +311,13 @@ static void test_roots_vs_ecm(const char *ecm, const char *nstr, int param, unsi
 int main(int argc, char **argv) {
   gmp_randinit_default(rs);
   gmp_randseed_ui(rs, 99);
-#ifdef GPUECM2_ONLY_BITS
-  const int maxbits = GPUECM2_ONLY_BITS;
-#else
-  const int maxbits = 4608;
-#endif
+  const int maxbits = GPUECM2_MAX_BITS;
   /* one size per CGBN size, and exact sizes (n with as many bits as the CGBN size) */
   for (int bits : {64, 500, 512, 600, 768, 1000, 1024, 1100, 1280, 1500, 1536, 1700, 1792, 2000, 2048, 2300, 2560,
-                   3000, 3072, 3300, 3584, 4000, 4096, 4500, 4608})
+                   3000, 3072, 3300, 3584, 4000, 4096, 4500, 4608, 5000, 5120, 6144, 7000, 7168, 8192, 9000, 10240,
+                   12288, 14336, 16000, 16384, 20480, 24576, 28672, 32000, 32768})
     if (bits <= maxbits) test_formulas(bits);
-  for (int bits : {200, 1000, 2000, 4000})
+  for (int bits : {200, 1000, 2000, 4000, 8000, 16000, 32000})
     if (bits <= maxbits) test_batch_inverse(bits);
   if (argc > 1) {
     const char *ecm = argv[1];
@@ -353,6 +353,21 @@ int main(int argc, char **argv) {
     if (maxbits >= 1600) test_roots_vs_ecm(ecm, n1600.c_str(), 3, 41, 1e4, "1000000", "-dickson 12");
     if (maxbits >= 3200) test_roots_vs_ecm(ecm, n3200.c_str(), 3, 42, 5e3, "500000", "");
     if (maxbits >= 4500) test_roots_vs_ecm(ecm, n4500.c_str(), 3, 43, 5e3, "500000", "-dickson 6");
+    /* large sizes (TPI 16 and 32), N a product of 1024-bit primes */
+    auto hard = [&](int bits, int seed) {
+      Z nn;
+      gmp_randstate_t r2;
+      gmp_randinit_default(r2);
+      gmp_randseed_ui(r2, seed);
+      random_hard_number(nn, r2, bits);
+      gmp_randclear(r2);
+      char *str = mpz_get_str(nullptr, 10, nn);
+      std::string out = str;
+      free(str);
+      return out;
+    };
+    if (maxbits >= 8000) test_roots_vs_ecm(ecm, hard(8000, 10).c_str(), 3, 44, 2e3, "500000", "");
+    if (maxbits >= 16400) test_roots_vs_ecm(ecm, hard(16400, 11).c_str(), 3, 45, 1e3, "200000", "-dickson 6");
   }
   printf("%s (%d failures)\n", failures ? "FAIL" : "OK", failures);
   return failures != 0;
