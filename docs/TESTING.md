@@ -83,10 +83,12 @@ and Prime95's parametrization 0. Of the 2147 reported ECM factors of composites 
 32768 bits there, 1828 are found by GMP-ECM 7.0.6 in step 2 with the logged B1 and sigma
 (1526 with its default B2, 302 only with 100 times it), 200 in step 1, and 119 not at all
 (99 of them 2024-2026 results with sigmas without a prefix, from a program with another
-parametrization or a much larger B2). The 44 hits in the file were chosen from the step 2
-ones to cover every CGBN size class from 5120 to 32768 bits (2-5 each), B1 from 1e4 to 11e6,
-parametrizations 0, 1 and 3, x^1, x^2 and Dickson(3, 6, 12), and default and larger B2;
-for each, GMP-ECM 7.0.6 found the factor in step 2 on the full composite. `default` in the
+parametrization or a much larger B2). The 51 hits in the file were chosen from the step 2
+ones to cover every CGBN size class from 5120 to 32768 bits (3-6 each), B1 from 1e4 to 11e6,
+parametrizations 0, 1 and 3, x^1, x^2 and Dickson(3, 6, 12, 30), and default and larger B2
+(9 with 100 times the default, 7 of them with `-maxmem 4000`, under which GMP-ECM's stage 2
+needs 3.4-3.7 GB instead of 4-13 GB and gpuecm2 chooses the same parameters); for each,
+GMP-ECM 7.0.6 found the factor in step 2 on the full composite. `default` in the
 B2 field stands for GMP-ECM's default (passing its effective B2 explicitly can give other
 stage 2 parameters).
 
