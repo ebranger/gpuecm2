@@ -1,25 +1,30 @@
-From 74c34e757e55a536375febb03254602095e881d7 Mon Sep 17 00:00:00 2001
+From 92f710a5c5fb1adc722af529fc26a690d0634bad Mon Sep 17 00:00:00 2001
 From: Erik Branger <erik.branger@physics.uu.se>
 Date: Wed, 14 Oct 2026 20:28:09 +0200
-Subject: [PATCH 2/2] GPU stage 1: CGBN kernels of 768, 1280, 2560 and 4608
- bits
+Subject: [PATCH 2/2] GPU stage 1: CGBN kernels of 768, 1280, 2560, 4608 and
+ 5120 to 32768 bits
 
 GMP-ECM 7.0.6 has kernels of 512, 1024, 1536, 2048, 3072 and 4096 bits and
 needs bits(N) + 6 <= BITS, so a 512-bit number used the 1024-bit kernel, a
 2048-bit number the 3072-bit one, and numbers of 4091 bits and more could not
-be run. The added sizes are 20-30% faster for such numbers and allow up to
-4602 bits. ECM_CGBN_BITS=b selects the kernel of b bits (for comparisons).
+be run. The added sizes up to 4608 bits are 20-30% faster for such numbers;
+the sizes from 5120 to 32768 bits (steps of 1024 bits up to 8192, 2048 up to
+16384, 4096 up to 32768; TPI 16 up to 8192, 32 above) allow numbers up to
+32762 bits, GMP-ECM's limit for its GPU code. Only kernel instantiations are
+added; the stage 1 code is unchanged. The large kernels take long to compile:
+-DCGBN_KERNEL_MAX_BITS=b compiles only the sizes up to b bits.
+ECM_CGBN_BITS=b selects the kernel of b bits (for comparisons).
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- cgbn_stage1.cu | 31 +++++++++++++++++++++++++++----
- 1 file changed, 27 insertions(+), 4 deletions(-)
+ cgbn_stage1.cu | 146 +++++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 142 insertions(+), 4 deletions(-)
 
 diff --git a/cgbn_stage1.cu b/cgbn_stage1.cu
-index 77e66ef..84bab32 100644
+index 77e66ef..24294eb 100644
 --- a/cgbn_stage1.cu
 +++ b/cgbn_stage1.cu
-@@ -733,10 +733,18 @@ int cgbn_ecm_stage1(mpz_t *factors, int *array_found,
+@@ -733,10 +733,73 @@ int cgbn_ecm_stage1(mpz_t *factors, int *array_found,
    typedef cgbn_params_t<8, 2048>  cgbn_params_2048;
    typedef cgbn_params_t<16, 3072> cgbn_params_3072;
    typedef cgbn_params_t<16, 4096> cgbn_params_4096;
@@ -39,10 +44,65 @@ index 77e66ef..84bab32 100644
 +  available_kernels.clear();
 +  for (uint32_t b : {512u, 768u, 1024u, 1280u, 1536u, 2048u, 2560u, 3072u, 4096u, 4608u})
 +    available_kernels.push_back(b);
++  /* Larger numbers, up to CGBN's limit of 32768 bits: steps of 1024 bits up to
++     8192 (TPI 16), then 2048 up to 16384 and 4096 up to 32768 (TPI 32, as CGBN
++     supports at most TPI limbs per thread). These take long to compile; with
++     -DCGBN_KERNEL_MAX_BITS=b only the sizes up to b bits are compiled. */
++#ifndef CGBN_KERNEL_MAX_BITS
++#define CGBN_KERNEL_MAX_BITS 32768
++#endif
++#if CGBN_KERNEL_MAX_BITS >= 5120
++  typedef cgbn_params_t<16, 5120> cgbn_params_5120;
++  available_kernels.push_back(5120);
++#endif
++#if CGBN_KERNEL_MAX_BITS >= 6144
++  typedef cgbn_params_t<16, 6144> cgbn_params_6144;
++  available_kernels.push_back(6144);
++#endif
++#if CGBN_KERNEL_MAX_BITS >= 7168
++  typedef cgbn_params_t<16, 7168> cgbn_params_7168;
++  available_kernels.push_back(7168);
++#endif
++#if CGBN_KERNEL_MAX_BITS >= 8192
++  typedef cgbn_params_t<16, 8192> cgbn_params_8192;
++  available_kernels.push_back(8192);
++#endif
++#if CGBN_KERNEL_MAX_BITS >= 10240
++  typedef cgbn_params_t<32, 10240> cgbn_params_10240;
++  available_kernels.push_back(10240);
++#endif
++#if CGBN_KERNEL_MAX_BITS >= 12288
++  typedef cgbn_params_t<32, 12288> cgbn_params_12288;
++  available_kernels.push_back(12288);
++#endif
++#if CGBN_KERNEL_MAX_BITS >= 14336
++  typedef cgbn_params_t<32, 14336> cgbn_params_14336;
++  available_kernels.push_back(14336);
++#endif
++#if CGBN_KERNEL_MAX_BITS >= 16384
++  typedef cgbn_params_t<32, 16384> cgbn_params_16384;
++  available_kernels.push_back(16384);
++#endif
++#if CGBN_KERNEL_MAX_BITS >= 20480
++  typedef cgbn_params_t<32, 20480> cgbn_params_20480;
++  available_kernels.push_back(20480);
++#endif
++#if CGBN_KERNEL_MAX_BITS >= 24576
++  typedef cgbn_params_t<32, 24576> cgbn_params_24576;
++  available_kernels.push_back(24576);
++#endif
++#if CGBN_KERNEL_MAX_BITS >= 28672
++  typedef cgbn_params_t<32, 28672> cgbn_params_28672;
++  available_kernels.push_back(28672);
++#endif
++#if CGBN_KERNEL_MAX_BITS >= 32768
++  typedef cgbn_params_t<32, 32768> cgbn_params_32768;
++  available_kernels.push_back(32768);
++#endif
  #endif
  
    /* Pointer to CUDA kernel. */
-@@ -744,8 +752,11 @@ int cgbn_ecm_stage1(mpz_t *factors, int *array_found,
+@@ -744,8 +807,11 @@ int cgbn_ecm_stage1(mpz_t *factors, int *array_found,
          uint32_t*, uint32_t*, uint32_t, uint32_t, uint32_t) = NULL;
  
    size_t n_log2 = mpz_sizeinbase(N, 2);
@@ -54,7 +114,7 @@ index 77e66ef..84bab32 100644
      if (kernel_bits >= n_log2 + CARRY_BITS) {
        BITS = kernel_bits;
        assert( BITS % 32 == 0 );
-@@ -771,6 +782,18 @@ int cgbn_ecm_stage1(mpz_t *factors, int *array_found,
+@@ -771,6 +837,78 @@ int cgbn_ecm_stage1(mpz_t *factors, int *array_found,
        } else if (BITS == cgbn_params_4096::BITS) {
          TPI = cgbn_params_4096::TPI;
          kernel = kernel_double_add<cgbn_params_4096>;
@@ -70,6 +130,66 @@ index 77e66ef..84bab32 100644
 +      } else if (BITS == cgbn_params_4608::BITS) {
 +        TPI = cgbn_params_4608::TPI;
 +        kernel = kernel_double_add<cgbn_params_4608>;
++#if CGBN_KERNEL_MAX_BITS >= 5120
++      } else if (BITS == cgbn_params_5120::BITS) {
++        TPI = cgbn_params_5120::TPI;
++        kernel = kernel_double_add<cgbn_params_5120>;
++#endif
++#if CGBN_KERNEL_MAX_BITS >= 6144
++      } else if (BITS == cgbn_params_6144::BITS) {
++        TPI = cgbn_params_6144::TPI;
++        kernel = kernel_double_add<cgbn_params_6144>;
++#endif
++#if CGBN_KERNEL_MAX_BITS >= 7168
++      } else if (BITS == cgbn_params_7168::BITS) {
++        TPI = cgbn_params_7168::TPI;
++        kernel = kernel_double_add<cgbn_params_7168>;
++#endif
++#if CGBN_KERNEL_MAX_BITS >= 8192
++      } else if (BITS == cgbn_params_8192::BITS) {
++        TPI = cgbn_params_8192::TPI;
++        kernel = kernel_double_add<cgbn_params_8192>;
++#endif
++#if CGBN_KERNEL_MAX_BITS >= 10240
++      } else if (BITS == cgbn_params_10240::BITS) {
++        TPI = cgbn_params_10240::TPI;
++        kernel = kernel_double_add<cgbn_params_10240>;
++#endif
++#if CGBN_KERNEL_MAX_BITS >= 12288
++      } else if (BITS == cgbn_params_12288::BITS) {
++        TPI = cgbn_params_12288::TPI;
++        kernel = kernel_double_add<cgbn_params_12288>;
++#endif
++#if CGBN_KERNEL_MAX_BITS >= 14336
++      } else if (BITS == cgbn_params_14336::BITS) {
++        TPI = cgbn_params_14336::TPI;
++        kernel = kernel_double_add<cgbn_params_14336>;
++#endif
++#if CGBN_KERNEL_MAX_BITS >= 16384
++      } else if (BITS == cgbn_params_16384::BITS) {
++        TPI = cgbn_params_16384::TPI;
++        kernel = kernel_double_add<cgbn_params_16384>;
++#endif
++#if CGBN_KERNEL_MAX_BITS >= 20480
++      } else if (BITS == cgbn_params_20480::BITS) {
++        TPI = cgbn_params_20480::TPI;
++        kernel = kernel_double_add<cgbn_params_20480>;
++#endif
++#if CGBN_KERNEL_MAX_BITS >= 24576
++      } else if (BITS == cgbn_params_24576::BITS) {
++        TPI = cgbn_params_24576::TPI;
++        kernel = kernel_double_add<cgbn_params_24576>;
++#endif
++#if CGBN_KERNEL_MAX_BITS >= 28672
++      } else if (BITS == cgbn_params_28672::BITS) {
++        TPI = cgbn_params_28672::TPI;
++        kernel = kernel_double_add<cgbn_params_28672>;
++#endif
++#if CGBN_KERNEL_MAX_BITS >= 32768
++      } else if (BITS == cgbn_params_32768::BITS) {
++        TPI = cgbn_params_32768::TPI;
++        kernel = kernel_double_add<cgbn_params_32768>;
++#endif
  #endif
        } else {
          outputf (OUTPUT_ERROR, "CGBN kernel not found for %d bits\n", BITS);

@@ -4,11 +4,14 @@ stage 2 with -gpu2 (gpuecm2) must give the same result as GMP-ECM's own stage 2
 on the CPU (-gpu): the same factors, and for the other curves the same
 "Product of G(f_i)" value (printed at -v -v -v).
 
-Usage: test_gpu2.py [path/to/ecm] [--quick]
+Usage: test_gpu2.py [path/to/ecm] [--quick] [--large]
 Runs GPU stage 1 twice and CPU stage 2 for all curves of each case (a few
-minutes; --quick: the first case only).
+minutes; --quick: the first case only; --large: also numbers of 7680 and 32251
+bits, which need the large kernels of 0002-cgbn-kernel-sizes.patch).
 """
 import os, re, subprocess, sys
+if hasattr(sys, "set_int_max_str_digits"):  # numbers of up to 32768 bits (9865 digits)
+    sys.set_int_max_str_digits(0)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 args = [a for a in sys.argv[1:] if not a.startswith("--")]
@@ -18,14 +21,22 @@ for line in open(os.path.join(HERE, "..", "tests", "data", "rsa_numbers.txt")):
     if line.strip() and not line.startswith("#"):
         name, val = line.split()[:2]
         rsa[name] = int(val)
-# (number, B1, curves, extra options)
+# (number, B1, curves, extra options); a product "A^e*B" of RSA numbers (not a perfect power)
 cases = [("RSA-1024", "5e4", "256", []), ("RSA-155", "1e5", "256", ["-dickson", "12"]),
          ("RSA-2048", "2e4", "128", [])]
 if "--quick" in sys.argv:
     cases = cases[:1]
+if "--large" in sys.argv:
+    cases += [("RSA-2048^3*RSA-1536", "1e4", "32", []), ("RSA-2048^15*RSA-1536", "2e3", "8", [])]
+def number(spec):
+    n = 1
+    for f in spec.split("*"):
+        name, _, e = f.partition("^")
+        n *= rsa[name] ** int(e or 1)
+    return n
 fails = 0
 for name, b1, curves, opts in cases:
-    n = rsa[name]
+    n = number(name)
     res = {}
     for mode in ("-gpu2", "-gpu"):
         r = subprocess.run([ECM, mode, "-v", "-v", "-v", "-gpucurves", curves, "-sigma", "3:1000"] + opts + [b1],

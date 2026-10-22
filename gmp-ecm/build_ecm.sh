@@ -10,6 +10,8 @@
 #   --workdir DIR   where GMP-ECM is downloaded and built (default: build-gmp-ecm)
 #   --arch NN       CUDA compute capability, e.g. 89 (default: that of GPU 0)
 #   --jobs N        parallel make jobs (default: 2)
+#   --max-bits B    compile the GPU stage 1 kernels up to B bits only (default 32768;
+#                   the large ones take long to compile, see gmp-ecm/README.md)
 #   --no-kernel-sizes   do not apply 0002-cgbn-kernel-sizes.patch
 # The result is WORKDIR/ecm-7.0.6/ecm.
 #
@@ -24,6 +26,7 @@ GPUECM2=$REPO/build
 WORK=$REPO/build-gmp-ecm
 ARCH=
 JOBS=2
+MAXBITS=
 KERNELS=1
 VERSION=7.0.6
 URL=https://gitlab.inria.fr/zimmerma/ecm/uploads/ad3e5019fef98819ceae58b78f4cce93/ecm-$VERSION.tar.gz
@@ -35,8 +38,9 @@ while [ $# -gt 0 ]; do
     --workdir) WORK=$2; shift 2 ;;
     --arch) ARCH=$2; shift 2 ;;
     --jobs) JOBS=$2; shift 2 ;;
+    --max-bits) MAXBITS=$2; shift 2 ;;
     --no-kernel-sizes) KERNELS=0; shift ;;
-    -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
     *) echo "unknown option $1" >&2; exit 1 ;;
   esac
 done
@@ -88,12 +92,14 @@ LDF="-L$LIB -Wl,-rpath,$LIB"
 [ -d /usr/lib/wsl/lib ] && LDF="$LDF -L/usr/lib/wsl/lib"   # libcuda under WSL
 ASM=--enable-asm-redc
 command -v m4 > /dev/null || ASM=--disable-asm-redc   # asm-redc needs m4
+CPPF="-I$INC -DHAVE_GPUECM2"
+[ -n "$MAXBITS" ] && CPPF="$CPPF -DCGBN_KERNEL_MAX_BITS=$MAXBITS"
 echo "configuring (GPU compute capability $ARCH)"
-./configure CFLAGS="-O2 -g" CPPFLAGS="-I$INC -DHAVE_GPUECM2" LDFLAGS="$LDF" LIBS="-lgpuecm2" \
+./configure CFLAGS="-O2 -g" CPPFLAGS="$CPPF" LDFLAGS="$LDF" LIBS="-lgpuecm2" \
   --enable-gpu=75 --with-cuda="$CUDA" --with-cgbn-include="$REPO/third_party/cgbn/include/cgbn" $ASM \
   > configure.out 2>&1 || { tail -20 configure.out; echo "configure failed (see $WORK/ecm-$VERSION/config.log)" >&2; exit 1; }
 sed -i "s/compute_75/compute_$ARCH/g; s/sm_75/sm_$ARCH/g" Makefile
-echo "building (make -j$JOBS; compiling the GPU kernels takes a few minutes)"
+echo "building (make -j$JOBS; compiling the GPU kernels takes up to about 15 minutes)"
 make -j"$JOBS" ecm > make.out 2>&1 || { tail -30 make.out; echo "build failed" >&2; exit 1; }
 ./ecm -h 2>&1 | grep -q -- "-gpu2" || { echo "built ecm lacks -gpu2" >&2; exit 1; }
 echo "built $WORK/ecm-$VERSION/ecm (GPU stage 1, -gpu2 for gpuecm2 stage 2)"
