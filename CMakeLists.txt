@@ -55,12 +55,13 @@ add_library(gpuecm2core STATIC
 )
 # The CGBN kernels (root generation, products) are compiled once per modulus size, each
 # size in its own translation unit (gen/roots_<BITS>.cu, gen/prod_<BITS>.cu; see
-# src/gpu/cgbn_ops.h), for the sizes of the ladder up to GPUECM2_MAX_BITS. The large sizes
-# take long to compile (see README.md); GPUECM2_ONLY_BITS compiles a single size, used for
-# all moduli up to it (development).
+# src/gpu/cgbn_ops.h), for the sizes of the ladder up to GPUECM2_MAX_BITS: 8192 by default
+# (about 15 minutes with -j 2), any size of the ladder up to 32768 on request (the large
+# sizes take long to compile, see README.md). GPUECM2_ONLY_BITS compiles a single size,
+# used for all moduli up to it (development).
 set(GPUECM2_CGBN_LADDER 512 768 1024 1280 1536 1792 2048 2560 3072 3584 4096 4608
                         5120 6144 7168 8192 10240 12288 14336 16384 20480 24576 28672 32768)
-set(GPUECM2_MAX_BITS 32768 CACHE STRING "Largest modulus size (bits) to compile CGBN kernels for")
+set(GPUECM2_MAX_BITS 8192 CACHE STRING "Largest modulus size (bits) to compile CGBN kernels for (up to 32768)")
 set(GPUECM2_ONLY_BITS "" CACHE STRING "Compile CGBN kernels for this BITS only (development)")
 set(GPUECM2_SIZES "")
 if(GPUECM2_ONLY_BITS)

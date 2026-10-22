@@ -10,8 +10,9 @@
 #   --workdir DIR   where GMP-ECM is downloaded and built (default: build-gmp-ecm)
 #   --arch NN       CUDA compute capability, e.g. 89 (default: that of GPU 0)
 #   --jobs N        parallel make jobs (default: 2)
-#   --max-bits B    compile the GPU stage 1 kernels up to B bits only (default 32768;
-#                   the large ones take long to compile, see gmp-ecm/README.md)
+#   --max-bits B    compile the GPU stage 1 kernels up to B bits (default: the largest
+#                   modulus of the gpuecm2 build, 8192 by default; at most 32768, the
+#                   large kernels take long to compile, see gmp-ecm/README.md)
 #   --no-kernel-sizes   do not apply 0002-cgbn-kernel-sizes.patch
 # The result is WORKDIR/ecm-7.0.6/ecm.
 #
@@ -40,7 +41,7 @@ while [ $# -gt 0 ]; do
     --jobs) JOBS=$2; shift 2 ;;
     --max-bits) MAXBITS=$2; shift 2 ;;
     --no-kernel-sizes) KERNELS=0; shift ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
     *) echo "unknown option $1" >&2; exit 1 ;;
   esac
 done
@@ -92,14 +93,23 @@ LDF="-L$LIB -Wl,-rpath,$LIB"
 [ -d /usr/lib/wsl/lib ] && LDF="$LDF -L/usr/lib/wsl/lib"   # libcuda under WSL
 ASM=--enable-asm-redc
 command -v m4 > /dev/null || ASM=--disable-asm-redc   # asm-redc needs m4
-CPPF="-I$INC -DHAVE_GPUECM2"
-[ -n "$MAXBITS" ] && CPPF="$CPPF -DCGBN_KERNEL_MAX_BITS=$MAXBITS"
-echo "configuring (GPU compute capability $ARCH)"
+# GPU stage 1 kernels up to the largest modulus gpuecm2 was built for (its stage 2 refuses
+# larger numbers; GMP-ECM then does stage 2 on the CPU)
+if [ -z "$MAXBITS" ]; then
+  if [ -f "$GPUECM2/gen/gpu/cgbn_size_list.h" ]; then
+    MAXBITS=$(sed -n 's/^#define GPUECM2_MAX_BITS \([0-9]*\).*/\1/p' "$GPUECM2/gen/gpu/cgbn_size_list.h")
+  elif [ -x "$GPUECM2/bin/gpuecm2" ]; then
+    MAXBITS=$("$GPUECM2/bin/gpuecm2" -h 2>&1 | sed -n 's/^Numbers of up to \([0-9]*\) bits.*/\1/p')
+  fi
+  [ -n "$MAXBITS" ] || MAXBITS=8192
+fi
+CPPF="-I$INC -DHAVE_GPUECM2 -DCGBN_KERNEL_MAX_BITS=$MAXBITS"
+echo "configuring (GPU compute capability $ARCH, stage 1 kernels up to $MAXBITS bits)"
 ./configure CFLAGS="-O2 -g" CPPFLAGS="$CPPF" LDFLAGS="$LDF" LIBS="-lgpuecm2" \
   --enable-gpu=75 --with-cuda="$CUDA" --with-cgbn-include="$REPO/third_party/cgbn/include/cgbn" $ASM \
   > configure.out 2>&1 || { tail -20 configure.out; echo "configure failed (see $WORK/ecm-$VERSION/config.log)" >&2; exit 1; }
 sed -i "s/compute_75/compute_$ARCH/g; s/sm_75/sm_$ARCH/g" Makefile
-echo "building (make -j$JOBS; compiling the GPU kernels takes up to about 15 minutes)"
+echo "building (make -j$JOBS; compiling the GPU kernels takes 3 minutes up to 8192 bits, 15 up to 32768)"
 make -j"$JOBS" ecm > make.out 2>&1 || { tail -30 make.out; echo "build failed" >&2; exit 1; }
 ./ecm -h 2>&1 | grep -q -- "-gpu2" || { echo "built ecm lacks -gpu2" >&2; exit 1; }
 echo "built $WORK/ecm-$VERSION/ecm (GPU stage 1, -gpu2 for gpuecm2 stage 2)"

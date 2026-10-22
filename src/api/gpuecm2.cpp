@@ -82,7 +82,8 @@ int gpuecm2_choose_params(gpuecm2_params p, const mpz_t n, double B1, const mpz_
 gpuecm2_stage2 *gpuecm2_stage2_new(const mpz_t n, const gpuecm2_params p, char *err, size_t errlen) {
   if (mpz_sgn(n) <= 0 || mpz_even_p(n)) { fail(err, errlen, "n must be odd and positive"); return nullptr; }
   if (mpz_sizeinbase(n, 2) > MAX_BITS) {
-    fail(err, errlen, "n has " + std::to_string(mpz_sizeinbase(n, 2)) + " bits; at most " + std::to_string(MAX_BITS) + " are supported");
+    fail(err, errlen, "n has " + std::to_string(mpz_sizeinbase(n, 2)) + " bits; at most " + std::to_string(MAX_BITS) +
+                          " are supported" + (MAX_BITS < 32768 ? " (build with -DGPUECM2_MAX_BITS=32768 for up to 32768)" : ""));
     return nullptr;
   }
   /* parameters as GMP-ECM makes them (bestD, choose_S): d1 a multiple of 6 with dF >= phi(d1)/2

@@ -18,6 +18,8 @@ per group, at most one residue per number in a process, so that a factor
 found on one curve cannot turn the next curve's number into a cofactor).
 """
 import collections, os, re, subprocess, sys, tempfile, time
+if hasattr(sys, "set_int_max_str_digits"):  # numbers of up to 32768 bits (9865 digits)
+    sys.set_int_max_str_digits(0)
 
 def main():
     args = sys.argv[1:]

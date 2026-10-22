@@ -187,7 +187,13 @@ def params_line(text):
     return m.groups() if m else None
 
 # ---------------------------------------------------------------- cases
-def cases(heavy):
+def program_max_bits(gpu):
+    """the largest modulus the gpuecm2 build supports (GPUECM2_MAX_BITS, from -h)"""
+    r = subprocess.run([gpu, "-h"], capture_output=True, text=True)
+    m = re.search(r"Numbers of up to (\d+) bits", r.stdout + r.stderr)
+    return int(m.group(1)) if m else 32768
+
+def cases(heavy, maxbits=32768):
     C = []
     def add(name, fn): C.append((name, fn))
 
@@ -197,13 +203,14 @@ def cases(heavy):
              3072, 3073, 3552, 3553, 3584, 3585, 4008, 4032, 4096, 4097, 4504, 4527, 4576, 4577, 4607, 4608,
              4609, 5120, 5121, 6144, 6145, 7168, 7169, 8192, 8193, 10240, 10241, 12288, 12289, 14336, 14337,
              16384, 16385, 20480, 20481, 24576, 24577, 28672, 28673, 32767, 32768]
+    sizes = [b for b in sizes if b <= maxbits]  # a build for smaller moduli (GPUECM2_MAX_BITS)
     for bits in sizes:
         add(f"size/{bits}", lambda R, bits=bits: compare(R, R.residues(bits, 2), "1873422"))
     # larger polynomials (dF = 16384) at the sizes where the conversions switch tiles
     for bits in (512, 992, 993, 1920, 1921, 2254, 2258, 3552, 3553, 4576, 4577, 4608):
         add(f"size-dF16384/{bits}", lambda R, bits=bits: compare(R, R.residues(bits, 1), "5706890290",
                                                                 ["-dickson", "6"]))
-    add("size/32769-refused", lambda R: refused(R, R.residues(32769, 1), "1873422"))
+    add(f"size/{maxbits + 1}-refused", lambda R: refused(R, R.residues(maxbits + 1, 1), "1873422"))
 
     # Brent-Suyama polynomials
     for opt in (["-power", "1"], ["-power", "2"], ["-power", "3"], ["-power", "6"], ["-power", "7"],
@@ -261,11 +268,12 @@ def cases(heavy):
         add("heavy/b2-512-1e13", lambda R: compare(R, R.residues(512, 1), "10000000000000", selfcheck=True))
         add("heavy/b2-2048-1e12", lambda R: compare(R, R.residues(2048, 1), "1000000000000", selfcheck=True))
         # large moduli with larger polynomials, also with split products
-        for bits in (8193, 16385):
+        big = [b for b in (8193, 16385) if b <= maxbits] or [min(maxbits, 8192)]
+        for bits in big:
             add(f"heavy/size-dF16384/{bits}", lambda R, bits=bits: compare(R, R.residues(bits, 1), "5706890290",
                                                                           ["-dickson", "6"]))
-        add("heavy/maxlogt/8193/12", lambda R: compare(R, R.residues(8193, 1), "5706890290", ["-dickson", "6"],
-                                                       env={"GPUECM2_MAX_LOGT": "12"}))
+        add(f"heavy/maxlogt/{big[0]}/12", lambda R: compare(R, R.residues(big[0], 1), "5706890290", ["-dickson", "6"],
+                                                            env={"GPUECM2_MAX_LOGT": "12"}))
         # natural NTT length switches: (bits, B2 giving the wanted dF with k = 2)
         for bits, dF in ((483, 1 << 21), (484, 1 << 21), (1186, 1 << 20), (1187, 1 << 20),
                          (2520, 362880), (2521, 362880)):
@@ -351,7 +359,7 @@ def main():
     ap.add_argument("--list", action="store_true")
     a = ap.parse_args()
     R = Runner(a.gpuecm2, a.ecm, a.cache, (10 if a.heavy else 4) << 30)
-    todo = [(n, f) for n, f in cases(a.heavy) if re.search(a.only, n)]
+    todo = [(n, f) for n, f in cases(a.heavy, program_max_bits(a.gpuecm2)) if re.search(a.only, n)]
     if a.list:
         for n, _ in todo: print(n)
         return 0

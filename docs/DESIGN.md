@@ -202,8 +202,8 @@ arithmetic; none of them is implemented.
 ## Robustness and limits
 
 - Kernels run ≲ 100 ms each, to stay under the Windows TDR and display watchdogs.
-- Sizes: moduli up to 32768 bits, or the largest size the build has (`GPUECM2_MAX_BITS`); a
-  residue of a larger number is skipped with a message. No limit on B2 or B2min: the G plan works with offsets from i0,
+- Sizes: moduli up to the largest size of the build (`GPUECM2_MAX_BITS`: 8192 bits by default,
+  32768 at most); a residue of a larger number is skipped with a message. No limit on B2 or B2min: the G plan works with offsets from i0,
   and memory is O(dF) on the GPU and O(progressions) on the host whatever k is (tested
   against GMP-ECM with B2min-B2 ranges up to 1e39, and with self-checked runs up to
   k = 2240 blocks).
@@ -244,7 +244,7 @@ arithmetic; none of them is implemented.
 | M6 | Performance: curve batching for small dF, streams/overlap, tuning, benchmarks against the CPU, a HIP-portability dry run. **Done:** Edwards root arithmetic, per-step kernel, CGBN size ladder, G roots per block, plan and memory-pool tuning, stream overlap, curve batching. Stage 2 is 1.6–2.7× faster than at the end of M5 for one curve (see the table below), and up to 50× for small B1 with batching; 100–200× one CPU core at GMP-ECM's default parameters (docs/BENCHMARKS.md). |
 | M7 | Library and tests for publication: C interface (`gpuecm2.h`, `libgpuecm2`), known stage 2 hits from real factoring work, boundary tests at every size and parameter threshold, large-B2 robustness (closed-form G plans). **Done**; see docs/TESTING.md and docs/INTEGRATION.md. |
 | M8 | Integration into GMP-ECM (a patch using the C interface in `cudawrapper.c` and `ecm.c`). **Done:** `gmp-ecm/` (option `-gpu2`, `build_ecm.sh`, `test_gpu2.py`). |
-| M9 | Large moduli, step 1: up to 32768 bits (CGBN's limit) in the current design, gpuecm2 and GMP-ECM's GPU stage 1 (more kernel sizes only). **Done:** CGBN sizes per translation unit (`GPUECM2_MAX_BITS`), a memory estimate from the allocations, kernels split for the watchdog, a two-pass RNS-to-limbs conversion and memory operands in `k_step` for large sizes; tests up to 32768 bits against GMP-ECM (boundary tests, `tests/large_tests.py`, 40 stage 2 hits of repunit cofactors). Stage 2 is 80-190 times one CPU core from B1 = 1e5 (docs/BENCHMARKS.md). |
+| M9 | Large moduli, step 1: up to 32768 bits (CGBN's limit) in the current design, gpuecm2 and GMP-ECM's GPU stage 1 (more kernel sizes only). **Done:** CGBN sizes per translation unit (`GPUECM2_MAX_BITS`), a memory estimate from the allocations, kernels split for the watchdog, a two-pass RNS-to-limbs conversion and memory operands in `k_step` for large sizes; tests up to 32768 bits against GMP-ECM (boundary tests, `tests/large_tests.py`, 44 stage 2 hits of repunit cofactors). Stage 2 is 80-190 times one CPU core from B1 = 1e5 (docs/BENCHMARKS.md). |
 
 ### M6 benchmarks (idle RTX 4070 Ti SUPER)
 

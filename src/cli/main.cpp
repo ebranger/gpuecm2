@@ -75,6 +75,7 @@ void usage(FILE *f) {
           "Usage: gpuecm2 [options] -resume <file> B1 [B2 | B2min-B2max]\n"
           "Runs ECM stage 2 on the GPU for residues saved by GMP-ECM (ecm -save / -gpu -save).\n"
           "B1 must not exceed the B1 the residues were saved at.\n"
+          "Numbers of up to %d bits (the GPUECM2_MAX_BITS of this build; at most 32768).\n"
           "Options:\n"
           "  -v            more verbose output (repeatable; -v -v -v adds per-phase times,\n"
           "                which makes step 2 slightly slower)\n"
@@ -101,7 +102,8 @@ void usage(FILE *f) {
           "                  1024     16 MB  76 MB  166 MB  357 MB  765 MB  1.6 GB\n"
           "                  1536     24 MB 114 MB  247 MB  532 MB  1.1 GB  2.4 GB\n"
           "                at most what is free after the rest of stage 2; no effect\n"
-          "                above 1920 bits\n");
+          "                above 1920 bits\n",
+          (int)GPUECM2_MAX_BITS);
 }
 
 /* B2 bounds: integer, or floating point like 7.7e11 (finite, not negative) */
@@ -265,8 +267,9 @@ Job prepare(const ResumeRecord &orig, const NState &st, const Stage2Request &req
     return J;
   }
   if (mpz_sizeinbase(rec.n.get(), 2) > GPUECM2_MAX_BITS) {
-    o.eprintf("Error: the number has %zu bits; gpuecm2 supports at most %d, skipping this residue\n",
-              mpz_sizeinbase(rec.n.get(), 2), GPUECM2_MAX_BITS);
+    o.eprintf("Error: the number has %zu bits; gpuecm2 supports at most %d%s, skipping this residue\n",
+              mpz_sizeinbase(rec.n.get(), 2), GPUECM2_MAX_BITS,
+              GPUECM2_MAX_BITS < 32768 ? " (build with -DGPUECM2_MAX_BITS=32768 for up to 32768)" : "");
     J.status = 1;
     return J;
   }

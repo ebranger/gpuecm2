@@ -28,7 +28,7 @@ if hasattr(sys, "set_int_max_str_digits"):  # numbers of up to 32768 bits (9865 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from boundary_tests import number, is_prime  # noqa: E402
+from boundary_tests import number, is_prime, program_max_bits  # noqa: E402
 
 # the CGBN sizes above 4608 bits (exact sizes and one bit more at some), and sizes in between
 SIZES = [4609, 5120, 6144, 7000, 8192, 8193, 10240, 12288, 14336, 16384, 16385, 20480, 24576, 28672, 32768]
@@ -179,9 +179,13 @@ def gpu_run(gpu, lines, B1, B2, opts, env=None):
 
 def cmd_check(a):
     cache = Cache(a.cache)
-    total = bad = 0
+    total = bad = skipped = 0
+    maxbits = program_max_bits(a.gpuecm2)
     for name, bits, B1, cv, pbits, variants in cases():
         if not re.search(a.only, name): continue
+        if bits > maxbits:  # a build for smaller moduli (GPUECM2_MAX_BITS)
+            skipped += 1
+            continue
         rec = cache.load(name)
         if not rec:
             print(f"skip {name}: not prepared")
@@ -225,15 +229,17 @@ def cmd_check(a):
             for i in mism:
                 print(f"    curve {i}: ecm {ref['curves'][i]['out'][0]} {ref['curves'][i]['params']} | "
                       f"gpuecm2 {outs[i][0]} {outs[i][2]} {outs[i][1][:100]}")
-    print(f"{total - bad}/{total} case variants agree exactly")
+    print(f"{total - bad}/{total} case variants agree exactly"
+          + (f" ({skipped} cases above the build's {maxbits} bits skipped)" if skipped else ""))
     return 1 if bad or not total else 0
 
 def cmd_bench(a):
     cache = Cache(a.cache)
     print(f"{'case':22s} {'variant':10s} {'params':48s} {'ecm s2/curve':>12s} {'gpuecm2 (1)':>11s} "
           f"{'(batch)':>9s} {'speedup':>8s}")
+    maxbits = program_max_bits(a.gpuecm2)
     for name, bits, B1, cv, pbits, variants in cases():
-        if not re.search(a.only, name): continue
+        if not re.search(a.only, name) or bits > maxbits: continue
         rec = cache.load(name)
         if not rec: continue
         for vname, B2, opts in variants:

@@ -9,15 +9,15 @@ implementation changes behaviour (boundary tests).
 |---|---|---|---|
 | `ctest` (unit tests) | GPU | 1 min | arithmetic, NTT, conversions, polynomial algorithms, curve formulas, root plans, stage 2 engine with self-check and fault injection, C interface |
 | `tests/run_hits.py` | GPU | 1-2 min | known stage 2 factors (`tests/data/stage2_hits.txt`) are found again, via the program and via the C interface (`capi_resume`) |
-| `tests/run_hits.py ... tests/data/stage2_hits_large.txt` | GPU | 1 min | the same for known stage 2 factors of 4609- to 32768-bit numbers |
-| `tests/large_tests.py` | GPU; GMP-ECM once | `prepare` about 15 CPU core-hours (once), `check` 2 min | same results as GMP-ECM on cached residues of 4609- to 32768-bit numbers, B1 = 1e4 to 11e6 |
+| `tests/run_hits.py ... tests/data/stage2_hits_large.txt` | GPU | 1 min | the same for known stage 2 factors of 4609- to 32768-bit numbers (those above the largest size of the build are skipped: all need `-DGPUECM2_MAX_BITS=32768`) |
+| `tests/large_tests.py` | GPU; GMP-ECM once | `prepare` about 15 CPU core-hours (once), `check` 2 min | same results as GMP-ECM on cached residues of 4609- to 32768-bit numbers, B1 = 1e4 to 11e6 (cases above the largest size of the build are skipped) |
 | `tests/input_tests.py` | GPU | 10 s | improper input (bad bounds and options, malformed or inconsistent resume lines, N even, too small or too large, unsupported curves) is refused with a message, nothing crashes, and the other residues of a file still run |
 | `tests/boundary_tests.py` | GPU, GMP-ECM | 10-15 min (`--heavy`: +1 h) | same results as GMP-ECM on both sides of every size and parameter threshold |
 | `tests/compare_stage2.py` | GPU, GMP-ECM | 40 min | same results as GMP-ECM for random curves on numbers of 330 to 4425 bits, alone and in batches, including GMP-ECM's handling of consecutive residues after a factor |
 | `tests/compare_params.py` | GMP-ECM | 10 min | the parameter lines (`dF`, `k`, `d`, `d2`, `i0`, polynomial) for a grid of sizes, B1, B2 and options |
 | `tests/check_curves.py` | GMP-ECM | 5 min | the curve setup of parametrizations 0-3 |
 | `test_roots <ecm>` | GPU, GMP-ECM | 1 min | every root of F and G against GMP-ECM's own (`-v -v -v -v -v`), also with G produced block by block |
-| `gmp-ecm/test_gpu2.py` | GPU, the `ecm` of `gmp-ecm/build_ecm.sh` | 3 min | the full GPU build of GMP-ECM: `-gpu2` gives the same result as GMP-ECM's CPU stage 2 for every curve of a GPU stage 1 run (512, 1024 and 2048 bits; `--large`: also 7679 and 32251 bits, 5 min more) |
+| `gmp-ecm/test_gpu2.py` | GPU, the `ecm` of `gmp-ecm/build_ecm.sh` | 3 min | the full GPU build of GMP-ECM: `-gpu2` gives the same result as GMP-ECM's CPU stage 2 for every curve of a GPU stage 1 run (512, 1024 and 2048 bits; `--large`: also 7679 and 32251 bits, 5 min more, for builds of gpuecm2 and GMP-ECM up to 32768 bits) |
 
 "Same results" means the same factor, or the same `Product of G(f_i)` value that GMP-ECM
 prints at `-v -v` when no factor is found. That value is H(-f_0) = the product over all
@@ -83,8 +83,8 @@ and Prime95's parametrization 0. Of the 2147 reported ECM factors of composites 
 32768 bits there, 1828 are found by GMP-ECM 7.0.6 in step 2 with the logged B1 and sigma
 (1526 with its default B2, 302 only with 100 times it), 200 in step 1, and 119 not at all
 (99 of them 2024-2026 results with sigmas without a prefix, from a program with another
-parametrization or a much larger B2). The 40 hits in the file were chosen from the step 2
-ones to cover every CGBN size class from 5120 to 32768 bits (2-4 each), B1 from 1e4 to 11e6,
+parametrization or a much larger B2). The 44 hits in the file were chosen from the step 2
+ones to cover every CGBN size class from 5120 to 32768 bits (2-5 each), B1 from 1e4 to 11e6,
 parametrizations 0, 1 and 3, x^1, x^2 and Dickson(3, 6, 12), and default and larger B2;
 for each, GMP-ECM 7.0.6 found the factor in step 2 on the full composite. `default` in the
 B2 field stands for GMP-ECM's default (passing its effective B2 explicitly can give other
@@ -104,9 +104,11 @@ its code path or a discrete parameter, so that off-by-one errors and edge effect
   (1920/1921 bits, where dF stops being a power of two); the switches of the RNS-to-limbs
   conversion tile (2254/2258 and 4576/4577 bits); sizes where the RNS primes leave no spare bit
   over the CRT bound (e.g. 1017, 1916, 4008, 4504 bits), with N close to 2^bits; tiny moduli
-  (64 bits); 4608 bits at small and larger dF; 32768 bits, the maximum; 32769 bits must be
-  refused. Above 4608 bits the numbers are products of primes of about 1024 bits (larger
-  primes take too long to find); `--heavy` adds dF = 16384 at 8193 and 16385 bits.
+  (64 bits); 4608 bits at small and larger dF; the largest size of the build (8192 bits by
+  default, 32768 at most; `gpuecm2 -h` shows it, and the sizes above it are left out), and one
+  bit more must be refused. Above 4608 bits the numbers are products of primes of about 1024
+  bits (larger primes take too long to find); `--heavy` adds dF = 16384 at 8193 and 16385
+  bits (or at the largest size of the build).
 - NTT length: products longer than the longest NTT for the modulus are split, and the product
   tree, inversion and evaluation switch to exact-product fallbacks. `GPUECM2_MAX_LOGT` forces
   short NTTs at small sizes (2^12..2^14 with dF = 16384); `--heavy` also tests the natural
@@ -146,7 +148,7 @@ bounds must be complete numbers in range (B1 up to GMP-ECM's 2^53 - 1, finite B2
 polynomial degree 1 to 1000, -maxmem and -batch not negative); otherwise gpuecm2 stops
 before reading the file. A resume line that cannot be used is skipped with a message and
 the other lines are processed: unknown fields, missing fields, bad checksum, N not an odd
-number above 1 (or above the largest size of the build, 32768 bits by default, or an invalid
+number above 1 (or above the largest size of the build, 8192 bits by default, or an invalid
 expression), a B1 field that is not a finite non-negative number, PARAM outside 0-3,
 invalid sigma, non-ECM methods and non-Montgomery curves, and singular curves (A^2 = 4). The
 C interface refuses stage 2 parameters that GMP-ECM would never make and reports singular

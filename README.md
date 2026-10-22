@@ -6,8 +6,8 @@ NVIDIA GPU. It reads the residues that GMP-ECM saves after stage 1 (`ecm -save`,
 exactly GMP-ECM's stage 2 parameters, covers the same primes, and finds the same factors.
 For every curve tested, its results agree with GMP-ECM's bit for bit (including GMP-ECM's
 internal "Product of G(f_i)" value), and it finds again 1461 stage 2 factors from logs of real
-factoring work, and 40 more on repunit cofactors of 4625 to 31309 bits. Numbers of up to
-32768 bits are supported.
+factoring work, and 44 more on repunit cofactors of 4625 to 31309 bits. Numbers of up to
+8192 bits are supported by the default build, up to 32768 bits by a build for larger numbers.
 
 On an RTX 4070 Ti SUPER a stage 2 at GMP-ECM's default parameters takes 160–240 times less
 time than GMP-ECM on one core of an i7-14700F, for numbers of 512 to 4096 bits and B1 from
@@ -87,8 +87,8 @@ The options mean what they mean for `ecm` (stage 2 only). In addition:
 - While the GPU works the CPU thread sleeps, so all cores stay available for CPU stage 1;
   `-spin` busy-waits instead (no measurable speed difference on the test system).
 
-Limits: odd numbers of up to 32768 bits, or the `GPUECM2_MAX_BITS` of the build (other residues
-are skipped with a message); any B2
+Limits: odd numbers of up to 8192 bits, or up to 32768 bits with a build for larger numbers
+(see [Build](#build); other residues are skipped with a message); any B2
 (B2 and B2min may exceed 2^64); parametrizations 0–3 and curves given by A (not GMP-ECM's
 `-torsion` curves). Improper options or bounds are refused before anything runs, and
 unusable resume lines are skipped with a message (docs/TESTING.md).
@@ -112,14 +112,25 @@ cd build && ctest
 cmake --install build --prefix /usr/local   # gpuecm2, libgpuecm2.so, gpuecm2.h
 ```
 
-The CGBN kernels are compiled for 24 modulus sizes, 512 to 32768 bits. The large sizes take
-long: about 50 minutes for all of them with `-j 2` (100 minutes of CPU time; the 32768-bit size
-alone takes 24 minutes and 9 GB of memory, the 28672-bit one 16 minutes and 6.4 GB), against
-7 minutes for the sizes up to 4608 bits. `-DGPUECM2_MAX_BITS=b` compiles the sizes up to b bits
-only (moduli up to b bits): 4608 takes 7 minutes, 8192 about 12, 16384 about 20. `-j 2` needs
-up to about 11 GB of memory with all sizes; with less, use `-j 1` (9 GB) or a lower
-`GPUECM2_MAX_BITS`. For development, `-DGPUECM2_ONLY_BITS=1024`
-builds a single size (moduli up to 1024 bits) in about a minute.
+The default build handles numbers of up to 8192 bits. The curve arithmetic is compiled once
+per modulus size (CGBN kernels), and the sizes above 8192 bits take long to compile, so they
+are an option: `-DGPUECM2_MAX_BITS=b` adds the sizes up to b bits, for numbers of up to
+32768 bits.
+
+| `-DGPUECM2_MAX_BITS=` | numbers of up to | sizes added | build time (`-j 2`) | memory (`-j 2`) |
+|---|---|---|---|---|
+| 8192 (default) | 8192 bits | 512 to 8192 bits (16 sizes) | about 15 minutes | about 4 GB |
+| 16384 | 16384 bits | 10240, 12288, 14336, 16384 | about 20 minutes | about 4 GB |
+| 24576 | 24576 bits | and 20480, 24576 | about 30 minutes | about 6 GB |
+| 32768 | 32768 bits | and 28672, 32768 | about 50 minutes | about 11 GB (9 GB with `-j 1`) |
+
+```
+cmake -S . -B build -DGPUECM2_MAX_BITS=32768   # numbers of up to 32768 bits
+```
+
+Other values select the sizes up to them (e.g. 12288). gpuecm2 refuses larger numbers with a
+message naming the option, and `gpuecm2 -h` shows the limit of a build. For development,
+`-DGPUECM2_ONLY_BITS=1024` builds a single size (numbers of up to 1024 bits) in about a minute.
 
 On Windows, use the MSVC toolchain with GMP from vcpkg (`-DGMP_ROOT=...`); the library is then
 built as a static library.
@@ -138,9 +149,10 @@ python3 gmp-ecm/test_gpu2.py                # checks it against GMP-ECM's CPU st
 `build_ecm.sh` downloads the GMP-ECM 7.0.6 release, checks its checksum, applies the patches in
 `gmp-ecm/` and builds `ecm` with GPU support for the GPU in the machine (`--arch NN` for
 another compute capability, `--gpuecm2 DIR` for an installed gpuecm2, `--max-bits B` to compile
-the GPU stage 1 kernels up to B bits only, `--no-kernel-sizes` to leave GMP-ECM's GPU stage 1
-kernels as they are; see [gmp-ecm/README.md](gmp-ecm/README.md)). With all kernels the build
-takes about 16 minutes.
+the GPU stage 1 kernels up to B bits, by default up to the largest size of the gpuecm2 build,
+`--no-kernel-sizes` to leave GMP-ECM's GPU stage 1 kernels as they are; see
+[gmp-ecm/README.md](gmp-ecm/README.md)). The build takes about 3 minutes with the kernels up to
+8192 bits and about 16 with all of them, up to 32768 bits.
 The patches are under the GPL, like GMP-ECM; see that file.
 
 Usage is that of GMP-ECM's `-gpu` with one more option:
