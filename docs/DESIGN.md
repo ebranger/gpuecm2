@@ -97,8 +97,8 @@ The C interface is shaped so that GMP-ECM can call it from its per-curve stage 2
     stage 2 at small dF (32251 bits, B1 = 1e5). They were first used from 576 limbs, where
     they are faster for every batch size; below that they win by much less when a batch
     gives the conversions many coefficients (whole stage 2 with GMP-ECM's parameters and
-    automatic batches: 1.00 at 2560 bits, 1.01 at 3072-4096, 1.02-1.03 at 6144-8192, 0.96
-    at 2048) than with few (polynomial part for one curve and dF = 2048-4096: 1.15 at 4096
+    automatic batches: 1.00 at 2560 bits, 1.01 at 3072-4096, 1.02-1.03 at 6144-8192,
+    1.04-1.08 at 10240-16384, 0.96 at 2048) than with few (polynomial part for one curve and dF = 2048-4096: 1.15 at 4096
     bits, 1.7 at 8192, 2.1 at 16384), so the threshold is now 96 limbs.
     `bench/bench_conv` measures both directions.
   - Kernels are kept short (tens of ms; Windows' watchdog, a display on the GPU) at large
@@ -139,7 +139,8 @@ The C interface is shaped so that GMP-ECM can call it from its per-curve stage 2
   - Whole stage 2, `bench/bench_stage2` (GMP-ECM's parameters, automatic batch, best of 3,
     limbs/RNS): 1.07 and 1.05 at 1024 bits (B1 = 1e6, 11e6), 1.08/1.06 at 1536, 1.06/1.04 at
     2048, 1.15/1.12 at 3072 (1e6, 3e6), 1.23/1.17 at 4096, 1.16 at 6144 (1e6), 1.27/1.26 at
-    8192 (1e5, 1e6). At 8192 bits and B1 = 1e6 the polynomial phases go from 68.8 to 47.5
+    8192 (1e5, 1e6), 1.29 at 10240 (1e5), 1.24 at 12288 (1e5), 1.25/1.25 at 16384 (1e4,
+    1e5), 1.27 at 24576 (1e5), 1.27/1.28 at 32768 (1e4, 1e5). At 8192 bits and B1 = 1e6 the polynomial phases go from 68.8 to 47.5
     ms per curve, the root generation (29 ms) is unchanged; the conversions are still 2.6
     times the NTTs.
   - Tried and rejected: summing two products in 64 bits before each 96-bit addition in the

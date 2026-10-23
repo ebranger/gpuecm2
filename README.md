@@ -78,9 +78,9 @@ The options mean what they mean for `ecm` (stage 2 only). In addition:
 - `-rns` holds the polynomials as residues modulo a second set of NTT primes instead of
   limbs, which halves the work of the conversions around each polynomial product
   ([docs/DESIGN.md](docs/DESIGN.md)). The results are identical; stage 2 gets 4-8% faster
-  up to 2048 bits, 12-23% at 3072-4096 bits and 16-27% at 6144-8192 bits (the polynomial
-  arithmetic alone 1.5-1.8 times from 4096 bits on; the root generation is unchanged), for
-  about 6% more GPU memory. Off by default; `GPUECM2_RNS=1` in the environment turns it
+  up to 2048 bits, 12-23% at 3072-4096 bits, 16-27% at 6144-8192 bits and 24-29% at
+  10240-32768 bits (the polynomial arithmetic alone 1.5-1.8 times from 4096 bits on; the
+  root generation is unchanged), for about 6% more GPU memory. Off by default; `GPUECM2_RNS=1` in the environment turns it
   on, also for programs using the C interface.
 - Consecutive residues of the same number (as `ecm -save` and `ecm -gpu -save` write them) are
   processed together on the GPU when one curve alone cannot keep it busy (B1 below about 1e7).
