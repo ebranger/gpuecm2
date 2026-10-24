@@ -250,6 +250,11 @@ Stage2Engine::Stage2Engine(const mpz_t n, const Stage2Params &sp) : sp_(sp) {
   jmax_ = 2.0 * sp.dF * sp.d1 / eulerphi(sp.d1);
   imax_ = std::fabs(mpz_get_d(sp.i0.get())) + (double)sp.k * sp.dF * sp.d2 / eulerphi(sp.d2);
   cap_ = root_step_capacity(mpz_sizeinbase(n, 2));
+  /* the low levels of the product trees and of the evaluation mod n
+     (GPUECM2_ZN_LEVELS: how many, 0 for none; testing aid) */
+  int zl = 4;
+  if (const char *e = getenv("GPUECM2_ZN_LEVELS")) zl = atoi(e);
+  if (zl > 0) zn_levels_init(&zn_, n, zl);
   CUDA_CHECK(cudaStreamCreateWithFlags(&s_poly_, cudaStreamNonBlocking));
   CUDA_CHECK(cudaStreamCreateWithFlags(&s_roots_, cudaStreamNonBlocking));
   for (auto &e : ev_) CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
@@ -275,6 +280,7 @@ const Stage2Engine::Plans &Stage2Engine::plans_for(size_t batch) {
 Stage2Engine::~Stage2Engine() {
   if (s_poly_) cudaStreamSynchronize(s_poly_);
   if (s_roots_) cudaStreamSynchronize(s_roots_);
+  zn_levels_free(&zn_);
   for (auto &e : ev_)
     if (e) cudaEventDestroy(e);
   if (s_poly_) cudaStreamDestroy(s_poly_);
@@ -286,6 +292,7 @@ std::vector<Stage2Outcome> Stage2Engine::run_batch(const MontgomeryCurve *Cs, si
   std::vector<Stage2Outcome> outs(count);
   if (count == 0) return outs;
   const RnsContext &ctx = ctx_;
+  const ZnLevels *zn = zn_.levels > 0 ? &zn_ : nullptr;
   const size_t dF = sp_.dF, k = sp_.k, B = count, N = B * dF;
   const Plans &pl = plans_for(B);
   const cudaStream_t sp = s_poly_, sr = timed ? s_poly_ : s_roots_;
@@ -329,7 +336,7 @@ std::vector<Stage2Outcome> Stage2Engine::run_batch(const MontgomeryCurve *Cs, si
   uint32_t *FR = limb_alloc(ctx, N, sr);
   if (r == ROOTS_OK) r = gen.start(*pl.gF);
   if (r == ROOTS_OK) r = gen.next_block(ctx, FR, rfac.get());
-  if (r == ROOTS_OK) ctx.import_limbs(FR, N, N, FR, N, sr);  // (RNS storage; in place)
+  if (r == ROOTS_OK && !zn) ctx.import_limbs(FR, N, N, FR, N, sr);  // (RNS storage; in place)
   lap(tm.rootsF);
   if (r != ROOTS_OK) {
     limb_free(FR, sr);
@@ -345,7 +352,7 @@ std::vector<Stage2Outcome> Stage2Engine::run_batch(const MontgomeryCurve *Cs, si
     const size_t budget = stage2_gpu_budget(), need = stage2_gpu_bytes(n_.get(), sp_, B);
     if (budget > need) keep = (budget - need) / 10 * 8;
   }
-  tree_build(ctx, FR, dF, F, &tree, sp, B, keep);
+  tree_build(ctx, FR, dF, F, &tree, sp, B, keep, zn);
   limb_free(FR, sp);
   if (const char *fi = getenv("GPUECM2_INJECT_FAULT"))  // testing aid: 2: corrupt F (caught by the tree check)
     if (atoi(fi) == 2) {
@@ -370,13 +377,13 @@ std::vector<Stage2Outcome> Stage2Engine::run_batch(const MontgomeryCurve *Cs, si
   uint32_t *xbuf[2] = {nullptr, nullptr};
   if (!chk.empty() && ctx.rns_store())
     for (uint32_t *&x : xbuf) x = limb_alloc(ctx, N, sp);
-  auto limbs_of = [&](const uint32_t *A, int slot) -> const uint32_t * {
-    if (!xbuf[slot]) return A;
+  auto limbs_of = [&](const uint32_t *A, int slot, bool stored) -> const uint32_t * {
+    if (!xbuf[slot] || !stored) return A;
     ctx.export_limbs(A, N, N, xbuf[slot], N, sp);
     return xbuf[slot];
   };
-  const uint32_t *rootsF = chk.empty() ? nullptr : limbs_of(tree.level[0], 0);
-  const uint32_t *limbsF = chk.empty() ? nullptr : limbs_of(F, 1);
+  const uint32_t *rootsF = chk.empty() ? nullptr : limbs_of(tree.level[0], 0, tree.zn == 0);
+  const uint32_t *limbsF = chk.empty() ? nullptr : limbs_of(F, 1, true);
   for (size_t c = 0; c < chk.size(); c++) {
     Check &K = chk[c];
     gmp_randstate_t rs;
@@ -446,10 +453,10 @@ std::vector<Stage2Outcome> Stage2Engine::run_batch(const MontgomeryCurve *Cs, si
         if (plan_argument(pl.G, false, sp_, b * dF + i, v) && cpu_root(Cs[0], sp_.S, v, cg))
           chk[0].ok &= mpz_cmp(gv, cg) == 0;
       }
-      ctx.import_limbs(Gb[b % 2], N, N, Gb[b % 2], N, sp);  // (RNS storage; in place)
-      tree_build(ctx, Gb[b % 2], dF, G, nullptr, sp, B);
-      const uint32_t *rootsG = chk.empty() ? nullptr : limbs_of(Gb[b % 2], 0);
-      const uint32_t *limbsG = chk.empty() ? nullptr : limbs_of(G, 1);
+      if (!zn) ctx.import_limbs(Gb[b % 2], N, N, Gb[b % 2], N, sp);  // (RNS storage; in place)
+      tree_build(ctx, Gb[b % 2], dF, G, nullptr, sp, B, 0, zn);
+      const uint32_t *rootsG = chk.empty() ? nullptr : limbs_of(Gb[b % 2], 0, !zn);
+      const uint32_t *limbsG = chk.empty() ? nullptr : limbs_of(G, 1, true);
       for (size_t c = 0; c < chk.size(); c++) {  // G(r) = prod (r + g_j); accumulate prod (g_j - f_i)
         Check &K = chk[c];
         mpz_srcptr xs[1 + NCHK];
@@ -487,8 +494,8 @@ std::vector<Stage2Outcome> Stage2Engine::run_batch(const MontgomeryCurve *Cs, si
       CUDA_CHECK(cudaStreamSynchronize(sp));
     }
   }
-  poly_eval_tree(ctx, tree, I, H, V, sp);
-  ctx.export_limbs(V, N, N, V, N, sp);  // (RNS storage; in place)
+  poly_eval_tree(ctx, tree, I, H, V, sp, zn);
+  if (tree.zn == 0) ctx.export_limbs(V, N, N, V, N, sp);  // (RNS storage; in place)
   lap(tm.eval);
   /* first values (GMP-ECM's "Product of G(f_i)" debug line) and the products */
   {

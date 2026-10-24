@@ -15,6 +15,7 @@
 
 #include <gmp.h>
 
+#include "gpu/polyalg.h"
 #include "gpu/rns.h"
 #include "gpu/roots.h"
 #include "host/params.h"
@@ -111,6 +112,7 @@ class Stage2Engine {
   Z n_;
   Stage2Params sp_;
   RnsContext ctx_;
+  ZnLevels zn_;  // the low levels of the product trees and of the evaluation mod n
   double jmax_ = 0, imax_ = 0;  // largest arguments of the F and G roots
   size_t cap_ = 0;              // point additions per wave (root generation)
   /* root plans (on the GPU) per batch size: the number of progressions per

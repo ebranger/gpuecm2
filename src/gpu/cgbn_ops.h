@@ -45,6 +45,12 @@ struct ProdOps {
                      mpz_srcptr x, mpz_ptr out, cudaStream_t s);
   void (*roots_value)(const RnsContext &ctx, mpz_srcptr n, const uint32_t *roots, size_t ld, size_t len,
                       const mpz_srcptr *r, int nr, mpz_ptr *out, cudaStream_t s);
+  /* the Z/N levels (ZnLevels in polyalg.h) */
+  void (*zn_create)(void **ctx, mpz_srcptr n);
+  void (*zn_destroy)(void *ctx);
+  void (*zn_tree)(void *ctx, const uint32_t *in, uint32_t *out, size_t n, size_t batch, size_t m, cudaStream_t s);
+  void (*zn_mp)(void *ctx, const uint32_t *b, const uint32_t *ch, uint32_t *out, size_t n, size_t batch, size_t m,
+                cudaStream_t s);
 };
 
 /* specialised for each size B of the build, in roots_<B>.cu and prod_<B>.cu */

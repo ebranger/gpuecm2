@@ -246,13 +246,175 @@ void run_roots_value(const RnsContext &ctx, const mpz_t n, const uint32_t *roots
   }
 }
 
+/* ---- low levels of the product trees and of the evaluation mod n (ZnLevels, polyalg.h) ---- */
+
+/* a limb-major value (limb j of value i at A[j*ld + i]) to / from a CGBN number: thread t
+   of the group holds limbs t*LIMBS .. t*LIMBS+LIMBS-1 (EcEnv allows no padded sizes) */
+template <class Env>
+__device__ __forceinline__ void load_lm(typename Env::bn_t &r, const uint32_t *A, size_t ld, size_t i, int nl) {
+  constexpr int LIMBS = Env::BITS / 32 / Env::TPI;
+  const int t = threadIdx.x & (Env::TPI - 1);
+#pragma unroll
+  for (int l = 0; l < LIMBS; l++) {
+    const int j = t * LIMBS + l;
+    r._limbs[l] = j < nl ? A[(size_t)j * ld + i] : 0;
+  }
+}
+template <class Env>
+__device__ __forceinline__ void store_lm(uint32_t *A, size_t ld, size_t i, int nl, const typename Env::bn_t &r) {
+  constexpr int LIMBS = Env::BITS / 32 / Env::TPI;
+  const int t = threadIdx.x & (Env::TPI - 1);
+#pragma unroll
+  for (int l = 0; l < LIMBS; l++) {
+    const int j = t * LIMBS + l;
+    if (j < nl) A[(size_t)j * ld + i] = r._limbs[l];
+  }
+}
+
+/* One product-tree level (tree_build's layout, ld = batch*n): the level-l nodes x^m + A
+   (m = 2^l) of each pair, at entries c*n + 2mj and c*n + 2mj + m, give x^(da+db) + C at
+   c*n + 2mj, where the second node has degree db = min(m, n - 2mj - m) and
+     C_k = sum_(i + j = k) a_i b_j + a_(k-db) + b_(k-m)   (terms out of range omitted);
+   a node without a partner (n - 2mj <= m) is copied. One instance per output value; all
+   run m products (zero where j is out of range), Montgomery products a_i b_j / R summed
+   and multiplied by R^2 / R at the end (K[1] = R^2 mod n). */
+template <uint32_t TPI, uint32_t BITS>
+__global__ void k_zn_tree(const cgbn_mem_t<BITS> *K, uint32_t np0, const uint32_t *__restrict__ in,
+                          uint32_t *__restrict__ out, size_t n, size_t total, size_t m, int nl) {
+  typedef EcEnv<TPI, BITS> Env;
+  const size_t e = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) / TPI;
+  if (e >= total) return;
+  typename Env::context_t ctx(cgbn_no_checks);
+  Env E(ctx, &K[0], np0);
+  typename Env::bn_t acc, x, y;
+  const size_t c = e / n, t = e - c * n, base = t / (2 * m) * (2 * m), pos = t - base, ld = total;
+  if (n - base <= m) {  // a single node: copied
+    load_lm<Env>(x, in, ld, e, nl);
+    store_lm<Env>(out, ld, e, nl, x);
+    return;
+  }
+  const size_t a0 = c * n + base, b0 = a0 + m, db = n - base - m < m ? n - base - m : m;
+  cgbn_set_ui32(E.env, acc, 0);
+  for (size_t i = 0; i < m; i++) {
+    const size_t j = pos - i;  // unsigned: j < db means 0 <= pos - i < db
+    if (j >= db) continue;
+    load_lm<Env>(x, in, ld, a0 + i, nl);
+    load_lm<Env>(y, in, ld, b0 + j, nl);
+    E.mul(x, x, y);
+    E.add(acc, acc, x);
+  }
+  cgbn_load(E.env, y, const_cast<cgbn_mem_t<BITS> *>(&K[1]));
+  E.mul(acc, acc, y);
+  if (pos >= db && pos - db < m) {
+    load_lm<Env>(x, in, ld, a0 + pos - db, nl);
+    E.add(acc, acc, x);
+  }
+  if (pos >= m && pos - m < db) {
+    load_lm<Env>(x, in, ld, b0 + pos - m, nl);
+    E.add(acc, acc, x);
+  }
+  store_lm<Env>(out, ld, e, nl, acc);
+}
+
+/* One level of the transposed evaluation (poly_eval_tree, natural order): a parent at
+   c*n + 2mj with values b_0 .. b_(k-1) (k = min(2m, n - 2mj)) and children L (degree m,
+   at the same place) and R (degree k - m, after it) in the level-l array ch gives the
+   left child  r_i = sum_(j <= deg R) R_j b_(i+j)  (i < m) and the right child
+   r_i = sum_(j <= m) L_j b_(i+j)  (i < k - m), leading coefficients 1; a parent with one
+   child (k <= m) passes its values on. One instance per output value. */
+template <uint32_t TPI, uint32_t BITS>
+__global__ void k_zn_mp(const cgbn_mem_t<BITS> *K, uint32_t np0, const uint32_t *__restrict__ b,
+                        const uint32_t *__restrict__ ch, uint32_t *__restrict__ out, size_t n, size_t total,
+                        size_t m, int nl) {
+  typedef EcEnv<TPI, BITS> Env;
+  const size_t e = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) / TPI;
+  if (e >= total) return;
+  typename Env::context_t ctx(cgbn_no_checks);
+  Env E(ctx, &K[0], np0);
+  typename Env::bn_t acc, x, y;
+  const size_t c = e / n, t = e - c * n, base = t / (2 * m) * (2 * m), pos = t - base, ld = total;
+  if (n - base <= m) {
+    load_lm<Env>(x, b, ld, e, nl);
+    store_lm<Env>(out, ld, e, nl, x);
+    return;
+  }
+  const size_t p0 = c * n + base, dr = n - base - m < m ? n - base - m : m;
+  const bool left = pos < m;
+  const size_t i = left ? pos : pos - m, dc = left ? dr : m, c0 = left ? p0 + m : p0;  // the other child
+  cgbn_set_ui32(E.env, acc, 0);
+  for (size_t j = 0; j < m; j++) {
+    if (j >= dc) continue;
+    load_lm<Env>(x, ch, ld, c0 + j, nl);
+    load_lm<Env>(y, b, ld, p0 + i + j, nl);
+    E.mul(x, x, y);
+    E.add(acc, acc, x);
+  }
+  cgbn_load(E.env, y, const_cast<cgbn_mem_t<BITS> *>(&K[1]));
+  E.mul(acc, acc, y);
+  load_lm<Env>(x, b, ld, p0 + i + dc, nl);  // the leading 1
+  E.add(acc, acc, x);
+  store_lm<Env>(out, ld, e, nl, acc);
+}
+
+/* device constants for the Z/N levels: n and R^2 mod n */
+template <uint32_t BITS>
+struct ZnConst {
+  cgbn_mem_t<BITS> *K = nullptr;
+  uint32_t np0 = 0;
+  int nl = 0;
+};
+
+template <uint32_t TPI, uint32_t BITS>
+void zn_create(void **out, mpz_srcptr n) {
+  typedef cgbn_mem_t<BITS> mem_t;
+  ZnConst<BITS> *z = new ZnConst<BITS>;
+  std::vector<mem_t> h(2);
+  Z r2;
+  mpz_set_ui(r2, 1);
+  mpz_mul_2exp(r2, r2, 2 * BITS);
+  mpz_mod(r2, r2, n);
+  to_mem_host(h[0], n);
+  to_mem_host(h[1], r2.get());
+  CUDA_CHECK(cudaMalloc(&z->K, sizeof(mem_t) * 2));
+  CUDA_CHECK(cudaMemcpy(z->K, h.data(), sizeof(mem_t) * 2, cudaMemcpyHostToDevice));
+  z->np0 = np0_of(n);
+  z->nl = (int)((mpz_sizeinbase(n, 2) + 31) / 32);
+  *out = z;
+}
+template <uint32_t BITS>
+void zn_destroy(void *p) {
+  ZnConst<BITS> *z = static_cast<ZnConst<BITS> *>(p);
+  if (!z) return;
+  cudaFree(z->K);
+  delete z;
+}
+template <uint32_t TPI, uint32_t BITS>
+void zn_tree(void *p, const uint32_t *in, uint32_t *out, size_t n, size_t batch, size_t m, cudaStream_t s) {
+  const ZnConst<BITS> *z = static_cast<const ZnConst<BITS> *>(p);
+  const size_t total = n * batch;
+  if (!total) return;
+  k_zn_tree<TPI, BITS><<<grid_for(total, TPI), BLOCK, 0, s>>>(z->K, z->np0, in, out, n, total, m, z->nl);
+  CUDA_CHECK(cudaGetLastError());
+}
+template <uint32_t TPI, uint32_t BITS>
+void zn_mp(void *p, const uint32_t *b, const uint32_t *ch, uint32_t *out, size_t n, size_t batch, size_t m,
+           cudaStream_t s) {
+  const ZnConst<BITS> *z = static_cast<const ZnConst<BITS> *>(p);
+  const size_t total = n * batch;
+  if (!total) return;
+  k_zn_mp<TPI, BITS><<<grid_for(total, TPI), BLOCK, 0, s>>>(z->K, z->np0, b, ch, out, n, total, m, z->nl);
+  CUDA_CHECK(cudaGetLastError());
+}
+
 }  // namespace
 
 /* the entry points for this size */
 template <>
 const ProdOps &prod_ops<GPUECM2_SIZE_BITS>() {
   constexpr uint32_t B = GPUECM2_SIZE_BITS, T = GPUECM2_CGBN_TPI_FOR(GPUECM2_SIZE_BITS);
-  static const ProdOps ops = {run<T, B>, run_poly_value<T, B>, run_roots_value<T, B>};
+  static const ProdOps ops = {run<T, B>,         run_poly_value<T, B>, run_roots_value<T, B>,
+                              zn_create<T, B>,   zn_destroy<B>,        zn_tree<T, B>,
+                              zn_mp<T, B>};
   return ops;
 }
 #else  // the public functions, dispatching to the size of the modulus
@@ -277,6 +439,22 @@ void poly_value(const RnsContext &ctx, const mpz_t n, const uint32_t *coef, size
 void roots_value(const RnsContext &ctx, const mpz_t n, const uint32_t *roots, size_t ld, size_t len,
                  const mpz_srcptr *r, int nr, mpz_ptr *out, cudaStream_t s) {
   ops_for(mpz_sizeinbase(n, 2)).roots_value(ctx, n, roots, ld, len, r, nr, out, s);
+}
+
+bool zn_levels_init(ZnLevels *z, const mpz_t n, int levels) {
+  const ProdOps *o = prod_ops_for(mpz_sizeinbase(n, 2));
+  if (!o || levels <= 0) return false;
+  o->zn_create(&z->ctx, n);
+  z->levels = levels;
+  z->tree = o->zn_tree;
+  z->mp = o->zn_mp;
+  z->destroy = o->zn_destroy;
+  return true;
+}
+
+void zn_levels_free(ZnLevels *z) {
+  if (z->ctx && z->destroy) z->destroy(z->ctx);
+  *z = ZnLevels();
 }
 
 void product_gcd(const RnsContext &ctx, const mpz_t n, const uint32_t *V, size_t count, mpz_t g, cudaStream_t s) {

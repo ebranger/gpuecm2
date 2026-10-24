@@ -8,6 +8,7 @@
 #include <cuda_runtime.h>
 #include <gmp.h>
 
+#include "gpu/polyalg.h"
 #include "gpu/rns.h"
 
 /* g := gcd(prod V_i, n) for count residues in limb array V (leading dimension count) */
@@ -26,3 +27,9 @@ void poly_value(const RnsContext &ctx, const mpz_t n, const uint32_t *coef, size
    leading dimension ld; r[t] canonical) */
 void roots_value(const RnsContext &ctx, const mpz_t n, const uint32_t *roots, size_t ld, size_t len,
                  const mpz_srcptr *r, int nr, mpz_ptr *out, cudaStream_t s = 0);
+
+/* The low levels of the product trees and of the evaluation mod n (see ZnLevels in
+   polyalg.h) for n of a size this build has: levels 0 .. levels-1. False if n is too
+   large for the build. */
+bool zn_levels_init(ZnLevels *z, const mpz_t n, int levels);
+void zn_levels_free(ZnLevels *z);

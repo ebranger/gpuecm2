@@ -1,6 +1,8 @@
 /* M3 tests: product tree, series inversion, reduction mod F and the
    transposed multipoint evaluation, checked against GMP; with limbs and with
-   RNS storage (the arrays imported from / exported to limbs). */
+   RNS storage (the arrays imported from / exported to limbs), and with the
+   low levels of the trees and of the evaluation mod n (ZnLevels) where this
+   build has the modulus' size. */
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -12,18 +14,21 @@
 #include "gpu/cuda_check.h"
 #include "gpu/limbops.h"
 #include "gpu/polyalg.h"
+#include "gpu/prod.h"
 #include "gpu/rns.h"
 #include "host/mpz_class_lite.h"
 
 static int failures = 0;
 static gmp_randstate_t rs;
 static bool rns_store = false;  // the mode of the current run
+static int zn_levels = 0;       // ZnLevels of the current run (0: none)
 
 struct Vec {  // n residues, host copy + device array (ld = n) of the context's representation
   const RnsContext &ctx;
   size_t n;
   std::vector<Z> v;
   uint32_t *d = nullptr;
+  bool raw = false;  // holds limbs whatever the storage (no import / export)
   Vec(const RnsContext &c, size_t n_) : ctx(c), n(n_), v(n_) { CUDA_CHECK(cudaMalloc(&d, words() * 4)); }
   size_t words() const { return (size_t)ctx.coef_words() * (n ? n : 1); }
   ~Vec() { cudaFree(d); }
@@ -38,14 +43,15 @@ struct Vec {  // n residues, host copy + device array (ld = n) of the context's 
       for (int j = 0; j < nl; j++) h[(size_t)j * n + g] = tmp[j];
     }
     CUDA_CHECK(cudaMemcpy(d, h.data(), h.size() * 4, cudaMemcpyHostToDevice));
-    ctx.import_limbs(d, n, n, d, n);  // in place (coef_words() >= nlimbs())
+    if (!raw) ctx.import_limbs(d, n, n, d, n);  // in place (coef_words() >= nlimbs())
   }
   void download() {
     const int nl = ctx.nlimbs();
     std::vector<uint32_t> h((size_t)nl * n), tmp(nl);
     uint32_t *e;
     CUDA_CHECK(cudaMalloc(&e, words() * 4));
-    ctx.export_limbs(d, n, n, e, n);
+    if (raw) CUDA_CHECK(cudaMemcpy(e, d, words() * 4, cudaMemcpyDeviceToDevice));
+    else ctx.export_limbs(d, n, n, e, n);
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(h.data(), e, h.size() * 4, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaFree(e));
@@ -91,8 +97,8 @@ static std::vector<size_t> sample(size_t n, bool full) {
 }
 
 static void report(bool ok, const char *what, int bits, size_t n, int logTmax, const char *extra = "") {
-  printf("%s %-9s %4d bits, n=%-7zu Tmax=2^%d%s%s\n", ok ? "ok  " : "FAIL", what, bits, n, logTmax, extra,
-         rns_store ? " [rns]" : "");
+  printf("%s %-9s %4d bits, n=%-7zu Tmax=2^%d%s%s%s\n", ok ? "ok  " : "FAIL", what, bits, n, logTmax, extra,
+         rns_store ? " [rns]" : "", zn_levels ? " [zn]" : "");
   failures += !ok;
 }
 
@@ -106,10 +112,14 @@ static void run(int bits, size_t n, int want_logT) {
   const char *tag = fb ? " [fallback products]" : "";
   const int lt = ctx.logTmax();
 
+  ZnLevels zn;
+  const ZnLevels *znp = zn_levels > 0 && zn_levels_init(&zn, N.get(), zn_levels) ? &zn : nullptr;
+  if (zn_levels > 0 && !znp) return;  // size not in this build: the run without zn covers it
   Vec roots(ctx, n), F(ctx, n);
+  roots.raw = znp != nullptr;  // with ZnLevels the roots are limbs
   roots.random(N.get());
   ProductTree tree;
-  tree_build(ctx, roots.d, n, F.d, &tree);
+  tree_build(ctx, roots.d, n, F.d, &tree, 0, 1, 0, znp);
   F.download();
   bool ok = true;
   if (full) {
@@ -118,6 +128,7 @@ static void run(int bits, size_t n, int want_logT) {
     /* every tree node */
     for (int l = 0; l < tree.L && ok; l++) {
       Vec lev(ctx, n);
+      lev.raw = l < tree.zn;
       CUDA_CHECK(cudaMemcpy(lev.d, tree.level[l], lev.words() * 4, cudaMemcpyDeviceToDevice));
       lev.download();
       const size_t m = (size_t)1 << l;
@@ -180,7 +191,8 @@ static void run(int bits, size_t n, int want_logT) {
 
   /* polyeval: values[i] = H(-f_i) */
   Vec vals(ctx, n);
-  poly_eval_tree(ctx, tree, I.d, H.d, vals.d);
+  vals.raw = tree.zn > 0;
+  poly_eval_tree(ctx, tree, I.d, H.d, vals.d, 0, znp);
   vals.download();
   ok = true;
   for (size_t i : sample(n, full && n <= 300)) {
@@ -193,10 +205,12 @@ static void run(int bits, size_t n, int want_logT) {
   /* end to end (small n): H = G - F with G = prod (x + g_j); prod_i H(-f_i) = prod_{i,j} (g_j - f_i) */
   if (n <= 200) {
     Vec groots(ctx, n), Gp(ctx, n), Hp(ctx, n), v2(ctx, n);
+    groots.raw = znp != nullptr;
+    v2.raw = tree.zn > 0;
     groots.random(N.get());
-    tree_build(ctx, groots.d, n, Gp.d, nullptr);
+    tree_build(ctx, groots.d, n, Gp.d, nullptr, 0, 1, 0, znp);
     limb_sub(ctx, Gp.d, n, F.d, n, Hp.d, n, n);
-    poly_eval_tree(ctx, tree, I.d, Hp.d, v2.d);
+    poly_eval_tree(ctx, tree, I.d, Hp.d, v2.d, 0, znp);
     v2.download();
     Z prod, ref;
     mpz_set_ui(prod.get(), 1); mpz_set_ui(ref.get(), 1);
@@ -211,10 +225,12 @@ static void run(int bits, size_t n, int want_logT) {
   }
   tree_free(tree);
   CUDA_CHECK(cudaDeviceSynchronize());
+  if (znp) zn_levels_free(&zn);
 }
 
 int main(int argc, char **argv) {
-  /* [--quick] [--limbs | --rns] [--case bits n want_logT]; both modes by default */
+  /* [--quick] [--limbs | --rns] [--case bits n want_logT]; both storages, without
+     and with ZnLevels (4 levels) by default */
   bool quick = false, modes[2] = {true, true};
   int a = 1;
   for (; a < argc && argv[a][0] == '-' && strcmp(argv[a], "--case"); a++) {
@@ -223,9 +239,11 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[a], "--rns")) modes[0] = false;
   }
   gmp_randinit_default(rs);
-  for (int m = 0; m < 2; m++) {
+  for (int mz = 0; mz < 4; mz++) {
+    const int m = mz % 2;
     if (!modes[m]) continue;
     rns_store = m == 1;
+    zn_levels = mz >= 2 ? 4 : 0;
     gmp_randseed_ui(rs, 77);
     if (a + 4 == argc && strcmp(argv[a], "--case") == 0) {  // --case bits n want_logT
       run(atoi(argv[a + 1]), (size_t)atol(argv[a + 2]), atoi(argv[a + 3]));

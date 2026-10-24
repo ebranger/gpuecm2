@@ -20,6 +20,24 @@
 
 #include "gpu/rns.h"
 
+/* The low levels of the product trees and of the evaluation done mod n
+   directly (schoolbook products of the small nodes with Montgomery products
+   mod n, gpu/prod.h) instead of through the RNS: a node of degree 2m costs m
+   + 1 products mod n per coefficient there, against two conversions and the
+   transforms. Levels 0 .. levels-1 (nodes of degree up to 2^levels as their
+   products). The arrays of those levels are plain limb arrays (residues mod
+   n) also with RNS storage. Made by zn_levels_init (prod.h). */
+struct ZnLevels {
+  int levels = 0;
+  void *ctx = nullptr;
+  /* the level-l nodes (degree m = 2^l) of `in` -> level l+1 in `out` (tree_build's layout) */
+  void (*tree)(void *ctx, const uint32_t *in, uint32_t *out, size_t n, size_t batch, size_t m, cudaStream_t s) = nullptr;
+  /* the values b of the level-(l+1) nodes and the level-l array ch -> the values of the level-l nodes */
+  void (*mp)(void *ctx, const uint32_t *b, const uint32_t *ch, uint32_t *out, size_t n, size_t batch, size_t m,
+             cudaStream_t s) = nullptr;
+  void (*destroy)(void *ctx) = nullptr;
+};
+
 /* Product tree over n leaves. Level l (0 <= l < L, L = ceil(log2 n)) holds the
    products of 2^l consecutive leaves: node j has degree min(2^l, n - j 2^l)
    and its coefficients start at entry j*2^l of the level's n-entry array.
@@ -35,6 +53,9 @@ struct ProductTree {
      level[l] is then freed (nullptr): the evaluation does not need it. */
   std::vector<uint32_t *> fwd;
   int fwd_min = -1;
+  /* levels 0 .. zn-1 were multiplied mod n (ZnLevels) and are limb arrays
+     whatever the storage; poly_eval_tree then gives limb values */
+  int zn = 0;
 };
 
 /* All functions below work on `batch` independent problems of the same size
@@ -45,9 +66,10 @@ struct ProductTree {
    0..L-1 are kept in *tree (free with tree_free), and for n a power of two
    the transforms of as many top levels (down to nodes of degree 4) as fit in
    cache_bytes, which saves poly_eval_tree a conversion and a transform per
-   level. */
+   level. With zn, the roots are a limb array (with RNS storage too: they are
+   imported where the RNS levels begin) and the low levels are done mod n. */
 void tree_build(const RnsContext &ctx, const uint32_t *roots, size_t n, uint32_t *F, ProductTree *tree,
-                cudaStream_t s = 0, size_t batch = 1, size_t cache_bytes = 0);
+                cudaStream_t s = 0, size_t batch = 1, size_t cache_bytes = 0, const ZnLevels *zn = nullptr);
 void tree_free(ProductTree &tree, cudaStream_t s = 0);
 
 /* I (n coefficients) := 1 / rev(F) mod x^n, where rev(F) = x^n F(1/x)
@@ -75,6 +97,9 @@ class MulModF {
 };
 
 /* values[i] := H(-f_i) for the roots f_i of F (the leaves of tree), deg H < n,
-   using GMP-ECM's transposed ("Tellegen") product tree descent. */
+   using GMP-ECM's transposed ("Tellegen") product tree descent. If the tree
+   was built with Z/N levels (tree.zn > 0), the same zn must be given: those
+   levels are done mod n, and the values are a limb array (with RNS storage
+   too). */
 void poly_eval_tree(const RnsContext &ctx, const ProductTree &tree, const uint32_t *I, const uint32_t *H,
-                    uint32_t *values, cudaStream_t s = 0);
+                    uint32_t *values, cudaStream_t s = 0, const ZnLevels *zn = nullptr);

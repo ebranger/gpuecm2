@@ -7,7 +7,9 @@
    2. injected faults are caught by the self-check;
    3. RNS storage gives the same values as limbs (batches, with the
       self-check, with the tree cache, with the long-product fallback), and
-      its self-check catches the injected faults too.
+      its self-check catches the injected faults too;
+   4. the low levels mod n (ZnLevels: none, the default 4, 6) give the same
+      values, with both storages.
    Usage: test_stage2 */
 #include <cstdio>
 #include <cstdlib>
@@ -80,6 +82,37 @@ static void compare_rns(const MontgomeryCurve &C0, const Stage2Params &sp, gmp_r
   }
 }
 
+/* the same random curves (a batch) without and with the low levels mod n */
+static void compare_zn(const MontgomeryCurve &C0, const Stage2Params &sp, gmp_randstate_t rs) {
+  std::vector<MontgomeryCurve> Cs(3);
+  for (MontgomeryCurve &c : Cs) {
+    mpz_set(c.n.get(), C0.n.get());
+    mpz_urandomm(c.A.get(), rs, c.n.get());
+    mpz_urandomm(c.u.get(), rs, c.n.get());
+  }
+  const int bits = (int)mpz_sizeinbase(C0.n.get(), 2);
+  char what[240];
+  for (int rns = 0; rns < 2; rns++) {
+    stage2_set_rns_store(rns != 0);
+    std::vector<Stage2Outcome> ref;
+    for (const char *zl : {"0", "4", "6"}) {
+      set_env("GPUECM2_ZN_LEVELS", zl);
+      Stage2Engine eng(C0.n.get(), sp);
+      set_env("GPUECM2_ZN_LEVELS", nullptr);
+      const std::vector<Stage2Outcome> o = eng.run_batch(Cs.data(), Cs.size(), false, zl[0] == '4');
+      if (ref.empty()) { ref = o; continue; }
+      bool ok = eng.ok();
+      for (size_t c = 0; ok && c < Cs.size(); c++)
+        ok &= o[c].status == ref[c].status && !o[c].check_failed && o[c].have_full &&
+              mpz_cmp(o[c].full_product.get(), ref[c].full_product.get()) == 0;
+      snprintf(what, sizeof what, "%d-bit N, dF=%lu, k=%lu%s: %s levels mod n give the same products%s", bits,
+               sp.dF, sp.k, rns ? " [rns]" : "", zl, zl[0] == '4' ? " (with self-check)" : "");
+      check(ok, what);
+    }
+  }
+  stage2_set_rns_store(false);
+}
+
 static void run_case(int bits, double B1, int S) {
   gmp_randstate_t rs;
   gmp_randinit_default(rs);
@@ -118,6 +151,7 @@ static void run_case(int bits, double B1, int S) {
     check(o.status == -1 && o.check_failed, what);
   }
   compare_rns(C, sp, rs, "");
+  compare_zn(C, sp, rs);
   gmp_randclear(rs);
 }
 

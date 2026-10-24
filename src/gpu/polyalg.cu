@@ -165,9 +165,13 @@ void exact_product(const RnsContext &ctx, const Operand &a, const Operand &b, si
 /* ------------------------------------------------------------------------- */
 
 void tree_build(const RnsContext &ctx, const uint32_t *roots, size_t n, uint32_t *F, ProductTree *tree,
-                cudaStream_t s, size_t batch, size_t cache_bytes) {
+                cudaStream_t s, size_t batch, size_t cache_bytes, const ZnLevels *zn) {
   const int L = clog2(n);
   const size_t B = batch, N = B * n;  // N: entries (and leading dimension) of every array
+  /* levels 0 .. zl-1 mod n; their arrays are limbs, imported (RNS storage)
+     where the RNS levels begin */
+  const int zl = zn ? std::min(zn->levels, L) : 0;
+  const bool imp = zn && ctx.rns_store();
   /* levels fmin .. L-1 keep their transforms (n a power of two, all levels
      multiplied with NTTs, nodes of degree >= 4) */
   int fmin = L;
@@ -178,6 +182,7 @@ void tree_build(const RnsContext &ctx, const uint32_t *roots, size_t n, uint32_t
       fit = std::min<size_t>(fit, (size_t)atol(e));
     fmin = std::max(2, L - (int)fit);
   }
+  fmin = std::max(fmin, zl);  // the Z/N levels use the coefficients
   if (tree) {
     tree->n = n;
     tree->batch = B;
@@ -185,14 +190,17 @@ void tree_build(const RnsContext &ctx, const uint32_t *roots, size_t n, uint32_t
     tree->level.assign(L, nullptr);
     tree->fwd.assign(L, nullptr);
     tree->fwd_min = fmin < L ? fmin : -1;
+    tree->zn = zl;
   }
   if (N == 0) return;
   if (L == 0) {  // n == 1: F = x + f_0
     limb_copy(ctx, roots, N, F, N, N, false, s);
+    if (imp) ctx.import_limbs(F, N, N, F, N, s);
     return;
   }
   uint32_t *cur = limb_alloc(ctx, N, s);
   limb_copy(ctx, roots, N, cur, N, N, false, s);
+  if (imp && zl == 0) ctx.import_limbs(cur, N, N, cur, N, s);
   for (int l = 0; l < L; l++) {
     if (tree) tree->level[l] = cur;
     const size_t m = (size_t)1 << l;
@@ -202,6 +210,13 @@ void tree_build(const RnsContext &ctx, const uint32_t *roots, size_t n, uint32_t
        Pair j of problem c starts at entry c*n + 2mj. */
     const size_t pairs = (n / m) / 2, total = B * pairs;
     const RowMap pmap = RowMap::grouped(2 * m, pairs, n);
+    if (l < zl) {  // mod n, the pairs and the leftover node
+      zn->tree(zn->ctx, cur, nxt, n, B, m, s);
+      if (imp && l + 1 == zl) ctx.import_limbs(nxt, N, N, nxt, N, s);
+      if (!tree) limb_free(cur, s);
+      cur = nxt;
+      continue;
+    }
     if (pairs && l + 1 > ctx.logTmax()) {
       for (size_t c = 0; c < B; c++) {
         Operand A{cur + c * n, N, 2 * m, m, false, 0, (long)m, m + 1};
@@ -428,9 +443,12 @@ void MulModF::mulmod(const uint32_t *G, uint32_t *H, cudaStream_t s) {
 /* ------------------------------------------------------------------------- */
 
 void poly_eval_tree(const RnsContext &ctx, const ProductTree &tree, const uint32_t *I, const uint32_t *H,
-                    uint32_t *values, cudaStream_t s) {
+                    uint32_t *values, cudaStream_t s, const ZnLevels *zn) {
   const size_t n = tree.n, B = tree.batch, N = B * n;
   if (N == 0) return;
+  /* levels 0 .. zl-1 mod n (tree.zn of tree_build): the values are exported
+     (RNS storage) where those levels begin */
+  const int zl = zn ? tree.zn : 0;
   if (n == 1) {  // deg H < 1
     limb_copy(ctx, H, N, values, N, N, false, s);
     return;
@@ -474,6 +492,13 @@ void poly_eval_tree(const RnsContext &ctx, const ProductTree &tree, const uint32
       b = b2;
     }
     uint32_t *bn = limb_alloc(ctx, N, s);
+    if (l < zl) {
+      if (l == zl - 1 && ctx.rns_store()) ctx.export_limbs(b, N, N, b, N, s);
+      zn->mp(zn->ctx, b, ch, bn, n, B, m, s);
+      limb_free(b, s);
+      b = bn;
+      continue;
+    }
     const size_t pc = n / (2 * m), total = B * pc;
     const RowMap pmap = RowMap::grouped(2 * m, pc, n);  // parent j of problem c at c*n + 2mj
     const RowMap kmap = RowMap::grouped(m, 2 * pc, n);  // its children (rows 2j, 2j+1)
