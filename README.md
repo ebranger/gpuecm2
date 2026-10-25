@@ -55,6 +55,8 @@ gpuecm2 can be used in two ways:
 - **GMP-ECM with GPU stage 1 and stage 2 in one run** (optional): `gmp-ecm/` holds patches
   for GMP-ECM 7.0.6 that add the option `-gpu2`, and a script that builds such an `ecm`
   linked to gpuecm2's library; see [Full GPU build of GMP-ECM](#full-gpu-build-of-gmp-ecm).
+  The same for Greg Childers' GMP-ECM fork (a faster GPU stage 1 for small numbers):
+  `gmp-ecm/fork/` makes its `-gpu` use gpuecm2's stage 2.
 
 The library has a C interface for other programs as well; see
 [docs/INTEGRATION.md](docs/INTEGRATION.md).
@@ -191,6 +193,14 @@ echo "<number>" | build-gmp-ecm/ecm-7.0.6/ecm -gpu2 [-gpucurves n] [-sigma 3:s] 
 
 Stage 1 and stage 2 run one after the other: on a GPU both keep it fully busy, and running
 them concurrently was measured to be slower (docs/BENCHMARKS.md).
+
+Greg Childers' fork of GMP-ECM (github.com/gchilders/gmp-ecm, branch `gpu-stage1-dynamic`)
+has a GPU stage 1 that is much faster for numbers of up to about 1000 bits (5–6 times at
+500 bits, 1.6–1.9 at 1000, 1.05–1.24 at 2000), and its own GPU stage 2. `gmp-ecm/fork/build_fork.sh` builds the fork with gpuecm2 as its stage 2 (the
+fork's `-gpu`: its stage 1, then gpuecm2's stage 2 with GMP-ECM's parameters), and
+`python3 gmp-ecm/fork/test_fork.py` checks it against the CPU stage 2. Which of the fork's
+own stage 2 and gpuecm2's is faster depends on the size and B1, so both builds are worth
+keeping; see [gmp-ecm/README.md](gmp-ecm/README.md).
 
 ## Tests
 

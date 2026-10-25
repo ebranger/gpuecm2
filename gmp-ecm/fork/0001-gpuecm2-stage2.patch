@@ -1,0 +1,227 @@
+From 22b24a37db4a6a7d6bffe20f5014cb0d8c70bee7 Mon Sep 17 00:00:00 2001
+From: ebranger <erik.branger@physics.uu.se>
+Date: Sun, 25 Oct 2026 22:08:34 +0100
+Subject: [PATCH] gpuecm2 stage 2 in place of the fork's GPU stage 2
+
+Built with -DHAVE_GPUECM2 (and linked to libgpuecm2), the stage 2 that
+follows a GPU stage 1 (-gpu) runs with gpuecm2's C interface instead of
+the fork's polynomial GPU stage 2: GMP-ECM's own stage 2 parameters (dF,
+k, d1, d2, i0, S) as the CPU chooses them (the default NTT rule; -ntt /
+-no-ntt as usual), gpuecm2 fitting them to the GPU memory (the smallest
+larger -k that fits, as the standalone gpuecm2 does), the same factors
+and "Product of G(f_i)" lines as GMP-ECM's CPU stage 2. If gpuecm2
+cannot run the stage 2, the CPU stage 2 runs. -cpustage2 and -gpubsgs
+are unchanged. The version line says "gpuecm2 stage 2".
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ cudawrapper.c | 134 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ main.c        |   4 ++
+ 2 files changed, 138 insertions(+)
+
+diff --git a/cudawrapper.c b/cudawrapper.c
+index 65af27b..2da81aa 100644
+--- a/cudawrapper.c
++++ b/cudawrapper.c
+@@ -164,6 +164,113 @@ A_from_sigma (mpz_t A, unsigned int sigma, mpz_t n)
+   mpz_clear (tmp);
+ }
+ 
++#ifdef HAVE_GPUECM2
++#include "gpuecm2.h"
++
++/* Stage 2 of the curves of this run with gpuecm2 (libgpuecm2) instead of the
++   fork's own GPU stage 2, with GMP-ECM's stage 2 parameters (dF, k,
++   root_params), so exactly the same primes are covered and the results are
++   those of GMP-ECM's stage 2 (the same factors; at -v -v -v the same
++   "Product of G(f_i)" lines). A[i] is curve i's Montgomery A, factors[i]
++   its stage 1 x; on return factors[i] / array_found[i] are set as the CPU
++   loop sets them (the caller prints the factors), and *factor_found to the
++   first factor's code. Returns 0,
++   or -1 if gpuecm2 cannot be used (then the CPU loop runs; factors[] still
++   holds the residues). */
++static int
++stage2_gpuecm2 (mpz_t *factors, int *array_found, mpz_t *A,
++                unsigned int nb_curves, mpz_t n, unsigned long dF,
++                unsigned long k, root_params_t *root_params, mpz_t B2min,
++                mpz_t B2, int *factor_found, int verbose_level,
++                const ecm_params params, double B1)
++{
++  gpuecm2_params gp;
++  gpuecm2_stage2 *s;
++  char err[256];
++  mpz_t *f, *v;
++  int *status;
++  unsigned int i;
++  int ret = 0;
++
++  gpuecm2_params_init (gp);
++  gp->dF = dF;
++  gp->k = k;
++  gp->d1 = root_params->d1;
++  gp->d2 = root_params->d2;
++  gp->S = root_params->S;
++  mpz_set (gp->i0, root_params->i0);
++  mpz_set (gp->B2min, B2min);
++  mpz_set (gp->B2, B2);
++  s = gpuecm2_stage2_new (n, gp, err, sizeof err);
++  if (s == NULL)
++    {
++      /* dF may not fit in the GPU memory: then use the parameters GMP-ECM
++         chooses with the smallest larger -k that fits (more, smaller blocks,
++         still covering B2), as the standalone gpuecm2 does */
++      char err2[256];
++      if (gpuecm2_choose_params (gp, n, B1, params->B2min, params->B2, k,
++                                 root_params->S, params->maxmem,
++                                 params->use_ntt, err2, sizeof err2) == 0
++          && gp->k > k
++          && (s = gpuecm2_stage2_new (n, gp, err2, sizeof err2)) != NULL)
++        outputf (OUTPUT_NORMAL, "GPU: dF=%lu does not fit in the GPU memory, "
++                 "stage 2 uses dF=%lu, k=%lu\n", dF, gp->dF, gp->k);
++    }
++  gpuecm2_params_clear (gp);
++  if (s == NULL)
++    {
++      outputf (OUTPUT_ERROR, "GPU: stage 2 with gpuecm2 not possible (%s), "
++                             "using the CPU\n", err);
++      return -1;
++    }
++  outputf (OUTPUT_VERBOSE, "GPU stage 2: gpuecm2 %s, batches of %zu curves\n",
++           gpuecm2_version (), gpuecm2_stage2_batch_size (s));
++  f = (mpz_t *) malloc (nb_curves * sizeof (mpz_t));
++  v = (mpz_t *) malloc (nb_curves * sizeof (mpz_t));
++  status = (int *) malloc (nb_curves * sizeof (int));
++  ASSERT_ALWAYS (f != NULL && v != NULL && status != NULL);
++  for (i = 0; i < nb_curves; i++)
++    {
++      mpz_init (f[i]);
++      mpz_init (v[i]);
++    }
++  if (gpuecm2_stage2_run (s, nb_curves, A, factors, status, f, v, 0) < 0)
++    ret = -1;
++  /* GMP-ECM's stage 2 debug line, at the verbosity the CPU loop uses for it
++     (one level below the user's) */
++  set_verbose (verbose_level - 1);
++  for (i = 0; i < nb_curves && ret == 0; i++)
++    if (status[i] == GPUECM2_NO_FACTOR)
++      outputf (OUTPUT_RESVERBOSE, "Product of G(f_i) = %Zd\n", v[i]);
++  set_verbose (verbose_level);
++  for (i = 0; i < nb_curves && ret == 0; i++)
++    if (status[i] != GPUECM2_NO_FACTOR && status[i] != GPUECM2_FACTOR_FOUND)
++      {
++        outputf (OUTPUT_ERROR, "GPU: stage 2 with gpuecm2 failed for curve %u "
++                               "(code %d), using the CPU\n", i, status[i]);
++        ret = -1;
++      }
++  for (i = 0; i < nb_curves && ret == 0; i++)
++    if (status[i] == GPUECM2_FACTOR_FOUND)
++      {
++        mpz_set (factors[i], f[i]);
++        array_found[i] = ECM_FACTOR_FOUND_STEP2;  /* (printed by the caller) */
++        if (*factor_found == ECM_NO_FACTOR_FOUND)
++          *factor_found = ECM_FACTOR_FOUND_STEP2;
++      }
++  for (i = 0; i < nb_curves; i++)
++    {
++      mpz_clear (f[i]);
++      mpz_clear (v[i]);
++    }
++  free (f);
++  free (v);
++  free (status);
++  gpuecm2_stage2_free (s);
++  return ret;
++}
++#endif /* HAVE_GPUECM2 */
++
+ 
+ int
+ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, double B1)
+@@ -315,7 +422,12 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
+           B2, B2_parm,
+           B2min, params->B2min,
+           &root_params,
++#ifdef HAVE_GPUECM2
++          /* gpuecm2 takes GMP-ECM's parameters as the CPU uses them */
++          B1, &k, params->S, params->use_ntt,
++#else
+           B1, &k, params->S, gpu_poly ? 1 : params->use_ntt,
++#endif
+           &po2, &dF, params->TreeFilename, params->maxmem, Fermat, modulus);
+   if (gpu_stage2 && !gpu_poly)
+     {
+@@ -375,6 +487,7 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
+ 
+   /* GPU stage 2 has kernels for every stage 1 configuration that the
+      planner picks; a forced one without them gets stage 2 on the CPU. */
++#ifndef HAVE_GPUECM2  /* gpuecm2 fits its stage 2 to the GPU memory itself */
+   if (gpu_poly && mpz_cmp (B2, B2min) >= 0)
+     {
+       /* the largest dF (a power of 2, as GMP-ECM's are with use_ntt) that
+@@ -443,6 +556,7 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
+                    "memory\n", dF);
+         }
+     }
++#endif /* HAVE_GPUECM2 */
+   mpz_clear (B2_parm);
+ 
+   if (gpu_stage2 && !gpu_poly && !gpu_ecm_stage2_supported (gpu_config))
+@@ -630,6 +744,22 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
+               mpz_init (As[i]);
+               A_from_sigma (As[i], CURVE_SIGMA (i), modulus->orig_modulus);
+             }
++#ifdef HAVE_GPUECM2
++          {
++            long rt = realtime ();
++            int r2 = stage2_gpuecm2 (factors, array_found, As, nb_curves,
++                                     n, dF, k, &root_params, B2min, B2,
++                                     &factor_found, params->verbose, params,
++                                     B1);
++            gputime2 = (float) (realtime () - rt);
++            for (i = 0; i < nb_curves; i++)
++              mpz_clear (As[i]);
++            free (As);
++            if (r2 != 0)
++              goto stage2_on_cpu;
++            youpi = factor_found;
++          }
++#else
+           youpi = gpu_ecm_stage2_poly (factors, array_found, As, n,
+                                        root_params.S, root_params.d1,
+                                        root_params.d2, root_params.i0, dF,
+@@ -638,6 +768,7 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
+           for (i = 0; i < nb_curves; i++)
+             mpz_clear (As[i]);
+           free (As);
++#endif
+         }
+       else
+         youpi = gpu_ecm_stage2 (factors, array_found, n, B2min, B2,
+@@ -659,6 +790,9 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
+       goto end_gpu_ecm_factors;
+     }
+ 
++#ifdef HAVE_GPUECM2
++ stage2_on_cpu:
++#endif
+   st2 = cputime ();
+ 
+   P.disc = 0; /* For stage2 this needs to be 0, in order not to use CM stuff */
+diff --git a/main.c b/main.c
+index 287944f..1476dce 100644
+--- a/main.c
++++ b/main.c
+@@ -1070,6 +1070,10 @@ main (int argc, char *argv[])
+       out += sprintf (out, ", --enable-gpu");
+ #endif
+ 
++#ifdef HAVE_GPUECM2
++      out += sprintf (out, ", gpuecm2 stage 2");
++#endif
++
+ #ifdef WANT_ASSERT
+       out += sprintf (out, ", --enable-assert");
+ #endif
+-- 
+2.53.0
+

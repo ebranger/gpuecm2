@@ -31,12 +31,41 @@ It is an addition to the standalone `gpuecm2` program, which works without it.
 The patches are made against the GMP-ECM 7.0.6 release, the latest with a release tarball
 (7.0.7 adds an option to map the stage 1 exponent from a file and fixes for macOS).
 
+## Greg Childers' GMP-ECM fork with gpuecm2 stage 2 (`fork/`)
+
+Greg Childers' fork of GMP-ECM (github.com/gchilders/gmp-ecm, branch `gpu-stage1-dynamic`)
+has its own GPU stage 1 (without CGBN; 5–6 times as fast as GMP-ECM's at 500 bits, 1.6–1.9
+at 1000, 1.05–1.24 at 2000, about as fast at 4000–16000 bits) and its own GPU stage 2, see
+the comparison in docs/BENCHMARKS.md. `fork/0001-gpuecm2-stage2.patch` replaces the fork's GPU stage 2 by
+gpuecm2: with `-gpu`, stage 1 runs with the fork's code and stage 2 with gpuecm2, in one
+call for all curves of the run, with GMP-ECM's own stage 2 parameters (the results are those
+of the CPU stage 2: the same factors, the same "Product of G(f_i)" values). As with `-gpu2`
+above, if dF does not fit in the free GPU memory the parameters of the smallest larger `-k`
+that fits are used, and if gpuecm2 cannot run the stage 2 at all the CPU stage 2 runs.
+`-cpustage2` (the CPU stage 2) and `-gpubsgs` (the fork's baby-step giant-step GPU stage 2)
+work as in the fork. The banner shows `gpuecm2 stage 2`.
+
+This gives two programs to choose from by hand; nothing selects between the two stage 2
+codes automatically. The fork as it is: its stage 2 is ahead at 500–1000 bits for small and
+medium B1 (by 1–20%). The fork with this patch: gpuecm2's stage 2 is as fast or faster from
+2000 bits (1.1–1.8 times as fast from 4000 bits) and at B1 = 1e7 (dF = 32768); see the
+stage 2 table of the comparison.
+
+- `fork/build_fork.sh [--gpuecm2 DIR] [--workdir DIR] [--arch NN] [--jobs N]`: clones the
+  fork at the commit the patch is made for (bbb6b40; both projects are under development),
+  applies the patch and builds `ecm` linked to `libgpuecm2` (default: the gpuecm2 build in
+  `build`, the result in `build-gmp-ecm-fork/gmp-ecm/ecm`). The fork is built from git, so
+  autoconf, automake, libtool and m4 are needed; its GPU kernels take about 20 minutes to
+  compile at `--jobs 2`.
+- `fork/test_fork.py [path/to/ecm]`: checks a build: `-gpu` (gpuecm2) and `-gpu -cpustage2`
+  must give the same result for every curve (four cases, one with factors found in stage 2).
+
 ## Licence
 
-The patches modify files of GMP-ECM that are under the GNU General Public License, version 3
-or later (`main.c`, `cudawrapper.c`, `cgbn_stage1.cu`) or the GNU Lesser General Public
-License, version 3 or later (`ecm.h.in`, `factor.c`); like the `ecm` program they produce,
-the patches are distributed under the GNU General Public License, version 3 or later
-(`COPYING` in the top directory). The rest of this repository, including `libgpuecm2` and
+The patches (including `fork/0001-gpuecm2-stage2.patch`) modify files of GMP-ECM that are
+under the GNU General Public License, version 3 or later (`main.c`, `cudawrapper.c`,
+`cgbn_stage1.cu`) or the GNU Lesser General Public License, version 3 or later (`ecm.h.in`,
+`factor.c`); like the `ecm` program they produce, the patches are distributed under the GNU
+General Public License, version 3 or later (`COPYING` in the top directory). The rest of this repository, including `libgpuecm2` and
 the scripts in this directory, is under the GNU Lesser General Public License, version 3 or
 later.

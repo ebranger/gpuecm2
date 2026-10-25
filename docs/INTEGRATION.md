@@ -72,7 +72,9 @@ The first is implemented for GMP-ECM 7.0.6 by [`gmp-ecm/0001-gpu2.patch`](../gmp
 (function `stage2_gpuecm2` in `cudawrapper.c`): built with `-DHAVE_GPUECM2` and linked with
 `-lgpuecm2`, `ecm` gets the option `-gpu2`. [`gmp-ecm/build_ecm.sh`](../gmp-ecm/build_ecm.sh)
 makes such a build; see [gmp-ecm/README.md](../gmp-ecm/README.md) and the README's
-"Full GPU build of GMP-ECM". The second is not patched: for CPU stage 1 the standalone
+"Full GPU build of GMP-ECM". The same function replaces the GPU stage 2 of Greg Childers'
+GMP-ECM fork in [`gmp-ecm/fork/0001-gpuecm2-stage2.patch`](../gmp-ecm/fork/0001-gpuecm2-stage2.patch)
+(there with the fork's `-gpu`). The second is not patched: for CPU stage 1 the standalone
 `gpuecm2 -resume` serves.
 
 1. **GPU stage 1 (`-gpu`), `cudawrapper.c`, `gpu_ecm()`.** After stage 1 on the GPU, a loop
