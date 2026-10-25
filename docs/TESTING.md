@@ -178,6 +178,13 @@ kind and requires the same products H(-f_i) for every curve (plain, with the sel
 with the tree cache, and with the long-product fallback of `GPUECM2_MAX_LOGT=12`), and the
 injected faults to be caught with RNS storage too.
 
+The low levels mod n (`GPUECM2_ZN_LEVELS`) are covered the same way: `test_polyalg` also
+runs every case (in both storages) with 4 levels mod n where the build has the modulus'
+size, including the odd n whose partial nodes GMP-ECM's dF values hardly ever produce in
+the low levels, and `test_stage2` requires the same products from engines with none, 4 and
+6 such levels (with the self-check for 4), in both storages. The suites (hits, large
+tests, boundary tests) run with the default number of levels.
+
 ## Testing aids
 
 Environment variables read by the stage 2 engine (for tests only):
@@ -196,3 +203,5 @@ Environment variables read by the stage 2 engine (for tests only):
   levels (tests the evaluation's switch between kept and recomputed levels).
 - `GPUECM2_DEBUG=1`: print the root generation plan.
 - `GPUECM2_RNS=1`: RNS storage of the polynomials (as `-rns`; also for the C interface).
+- `GPUECM2_ZN_LEVELS=z`: do the lowest z levels of the product trees and of the evaluation
+  mod n (0: none; the default depends on the size and the storage, docs/DESIGN.md).

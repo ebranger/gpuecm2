@@ -6,7 +6,7 @@ NVIDIA GPU. It reads the residues that GMP-ECM saves after stage 1 (`ecm -save`,
 exactly GMP-ECM's stage 2 parameters, covers the same primes, and finds the same factors.
 For every curve tested, its results agree with GMP-ECM's bit for bit (including GMP-ECM's
 internal "Product of G(f_i)" value), and it finds again 1461 stage 2 factors from logs of real
-factoring work, and 44 more on repunit cofactors of 4625 to 31309 bits. Numbers of up to
+factoring work, and 51 more on repunit cofactors of 4625 to 31309 bits. Numbers of up to
 8192 bits are supported by the default build, up to 32768 bits by a build for larger numbers.
 
 On an RTX 4070 Ti SUPER a stage 2 at GMP-ECM's default parameters takes 160–240 times less
@@ -14,6 +14,10 @@ time than GMP-ECM on one core of an i7-14700F, for numbers of 512 to 4096 bits a
 3e6 up (e.g. 12 ms instead of 2.3 s for a 1024-bit number at B1 = 3e6, 3.3 s instead of 655 s
 for 4096 bits at B1 = 11e7), and 80–190 times less for numbers of 8192 to 32768 bits from
 B1 = 1e5 (e.g. 1.3 s instead of 123 s for 32768 bits at B1 = 1e6); see [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+These figures were measured before the changes of late October 2026 (the low levels of the
+product trees mod n, a faster conversion from 3072 bits on, and the `-rns` option), which
+make stage 2 a further 4–12% faster by default, and up to 1.3 times with `-rns` for large
+numbers (docs/DESIGN.md).
 
 For a 1024-bit number and the B1 values from GMP-ECM's table (with GMP-ECM's
 default B2), on an RTX 4070 Ti SUPER and one core of an i7-14700F the following timings were

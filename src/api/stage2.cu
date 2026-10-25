@@ -93,6 +93,17 @@ bool plan_argument(const ProgressionPlan &P, bool isF, const Stage2Params &sp, s
   return false;
 }
 int clog2(size_t n) { int k = 0; while (((size_t)1 << k) < n) k++; return k; }
+/* How many low levels of the product trees and of the evaluation are done
+   mod n (ZnLevels), by default. A Z/N level costs products of about bits^2
+   each per coefficient, a level through the RNS conversions of a similar cost
+   (half of it with RNS storage) plus transforms: fewer levels pay as n grows.
+   Measured on an RTX 4070 Ti SUPER at GMP-ECM's parameters, B1 = 1e5 and 1e6
+   (stage 2 4-12% faster with limbs, 500-32768 bits; with RNS storage 3-8% up
+   to 6144 bits, 1-2% above). */
+int default_zn_levels(size_t bits, bool rns) {
+  if (rns) return bits <= 2048 ? 4 : bits <= 6144 ? 3 : bits <= 12288 ? 2 : 1;
+  return bits <= 6144 ? 4 : 3;
+}
 /* Number of progressions per curve for a root plan of `count` roots f(v) P
    with v up to vmax, for `batch` curves sharing the GPU, given that `cap`
    additions run concurrently. Each step does batch*nprog*S additions, best a
@@ -252,7 +263,7 @@ Stage2Engine::Stage2Engine(const mpz_t n, const Stage2Params &sp) : sp_(sp) {
   cap_ = root_step_capacity(mpz_sizeinbase(n, 2));
   /* the low levels of the product trees and of the evaluation mod n
      (GPUECM2_ZN_LEVELS: how many, 0 for none; testing aid) */
-  int zl = 4;
+  int zl = default_zn_levels(mpz_sizeinbase(n, 2), rns_store_);
   if (const char *e = getenv("GPUECM2_ZN_LEVELS")) zl = atoi(e);
   if (zl > 0) zn_levels_init(&zn_, n, zl);
   CUDA_CHECK(cudaStreamCreateWithFlags(&s_poly_, cudaStreamNonBlocking));

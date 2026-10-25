@@ -145,6 +145,23 @@ The C interface is shaped so that GMP-ECM can call it from its per-curve stage 2
     times the NTTs.
   - Tried and rejected: summing two products in 64 bits before each 96-bit addition in the
     tiles (fewer additions per multiply-add): 4-20% slower in all conversion kernels.
+- **Low levels mod n** (`ZnLevels`; an idea from the GPU stage 2 of Greg Childers' GMP-ECM
+  fork): the nodes of the product trees up to degree 2^z, and the matching levels of the
+  transposed evaluation, are multiplied with schoolbook products mod n (CGBN Montgomery
+  products, `k_zn_tree` and `k_zn_mp` in `prod.cu`) instead of conversions and transforms.
+  One thread group per output coefficient: a node of degree 2m costs m/2 products per
+  coefficient on average plus one product by R² (the sum of Montgomery products a_i b_j / R),
+  the middle products m + 1 per value. Those levels' arrays are limbs with both storages:
+  `tree_build` takes the roots as limbs and imports where the RNS levels begin, and
+  `poly_eval_tree` gives limb values. The kernels are bound by the per-output work (about
+  1 ns per product and 1.5 ns per level and coefficient at 1024 bits, against about 6 ns per
+  coefficient for a level through the RNS), so the level of degree 16 still pays at 1024
+  bits and the next does not; the RNS levels get relatively cheaper as n grows (and with RNS
+  storage), so fewer Z/N levels pay. Default z (measured at GMP-ECM's parameters, B1 = 1e5
+  and 1e6): with limbs 4 up to 6144 bits, 3 above; with RNS storage 4 up to 2048 bits, 3 up
+  to 6144, 2 up to 12288, 1 above. Stage 2 gets 4–12% faster with limbs (500–32768 bits:
+  7–12% at 1000–6000 bits, 4.5% at 32768) and with RNS storage 3–8% up to 6144 bits and 1–2%
+  above. `GPUECM2_ZN_LEVELS` overrides z (0: none).
 - **EC arithmetic for roots:** CGBN behind a thin wrapper, sizes in steps of 256 bits up to
   2048, 512 up to 4608, then 1024 up to 8192, 2048 up to 16384 and 4096 up to 32768 (TPI 4
   at 512 bits, 8 up to 1792 and at 3072, 16 up to 8192, 32 above; chosen by measurement up
@@ -216,21 +233,33 @@ redone on the cofactor, which is GMP-ECM's behaviour for consecutive lines with 
 
 ## Ideas evaluated (October 2026)
 
-Measured or estimated on the RTX 4070 Ti SUPER during the optimisation of the polynomial
-arithmetic; none of them is implemented.
+Measured or estimated on the RTX 4070 Ti SUPER. The first one is now implemented (RNS
+storage, above); the others are not.
 
 - **All-RNS polynomial arithmetic** (Montgomery reduction in RNS, Kawamura et al. /
-  Bajard–Imbert: the primes split into two bases, two base extensions per reduction instead
-  of RNS → limbs → RNS). A prototype base extension (half the primes to the other half,
-  approximate alpha) takes 0.6–14 ns per coefficient at 512–4608 bits, so one reduction costs
-  1.3–28 ns against 1.4–41 ns for the two conversions it replaces. Counting the conversions of
-  a whole stage 2 (all but the roots' and the final one become reductions), conversion time
-  would drop by 35–48% with the prototype, 55–61% with a base extension as efficient as the
-  limbs → RNS kernel: 7–20% of stage 2 at GMP-ECM's default parameters (most for large N and
-  small B1). Costs: about twice the memory for stored polynomials (P residues instead of nl
-  limbs per coefficient), one or two more primes, and a rewrite of the polynomial layer. A
-  candidate milestone; skipping reductions on some tree levels (more primes instead) could
-  add to it.
+  Bajard–Imbert). Estimated at 7–20% of stage 2 with about twice the memory for the stored
+  polynomials; implemented as RNS storage (`-rns`, see Arithmetic), which keeps only one of
+  the two bases and so needs about 6% more memory, and gives 4–29% depending on the size.
+- **Curve arithmetic in RNS as well** (the roots of F and G with RNS Montgomery products
+  instead of CGBN; removes CGBN, its 32768-bit limit and the per-size kernels). An RNS
+  Montgomery product needs two base extensions; measured with the extension kernels of RNS
+  storage (65536 values at a time, the whole GPU): 2.9 ns per product at 1024 bits, 7.9 at
+  2048, 20 at 4096, 71 at 8192, 267 at 16384 and 970 ns at 32768, against CGBN's Montgomery
+  product at 0.68, ≈2.7, 9.7, 32, 130 and 495 ns: 2–4.3 times as expensive (both do about
+  2 nl² multiply-adds; CGBN's carry chains run at 3–4.2 T multiply-adds/s, the 96-bit sums of
+  the extensions at 0.8–2.3 T). Lazy reduction saves little in Edwards additions (almost
+  every product feeds another product). With the roots at 29–47% of stage 2 (RNS storage,
+  GMP-ECM's parameters, 1024–32768 bits), stage 2 would be about 1.4–1.55 times slower from
+  2048 bits on and 2.2 times at 1024 bits, with 10–20% more memory (the root generation's
+  values take P ≈ 2 nl words). Not worth it for speed; it would only pay for portability (HIP)
+  and build time.
+- **Root arithmetic by transforms for large N** (as in Greg Childers' GMP-ECM fork,
+  `gpu_nmul.cuh`: numbers as about 17-bit digits, products by NTTs modulo two 30-bit primes,
+  Montgomery with R = B^d − 1, no zero padding, transforms of an operand reused within a point
+  addition; it reports stage 2 1.66–1.91 times faster at 32768–65536 bits than its schoolbook
+  roots, from about 12–16 kbit on). With our roots at 47% of stage 2 at 32768 bits, a 2–2.8
+  times faster root generation would make stage 2 about 1.35–1.4 times faster there. A new
+  arithmetic library for the root kernels: a candidate milestone for large numbers.
 - **NTT lengths 3·2^k** for dF that is not a power of two (above 1920 bits). Full pairs in
   the product trees always have power-of-two lengths; only the top-level products (products
   mod F, 1/F, the start of the evaluation, one partial node per level) would be shorter: 1–3%
@@ -239,6 +268,22 @@ arithmetic; none of them is implemented.
   fit in the 48 MB L2 one after the other, so that the second pass reads from L2): would save
   up to one DRAM round trip per transform for T ≥ 2^16; needs a prime offset in the kernels.
   Not tried; at most 10–20% of the NTT time.
+- **Two products summed in 64 bits** before each 96-bit addition in the conversion tiles
+  (fewer additions per multiply-add): tried, 4–20% slower in all conversion kernels.
+- **The Z/N levels with wide products** (full products summed, one Montgomery reduction per
+  output instead of one per product): tried, the same speed (the levels are bound by the
+  per-output work, not by the products). Karatsuba for the larger nodes (27 instead of 64
+  products for degree 8 × 8) would need a kernel per node with shared-memory sums: estimated
+  2–3% of stage 2 at 1024 bits. Keeping the middle Z/N levels in Montgomery form (no product
+  by R² per output) about 0.5%.
+- **The tree cache by default** (the fork keeps its transforms of F's tree in the free GPU
+  memory by default): with the Z/N levels `-treecache` still gives 1–4.4% at 1000–1500 bits
+  (B1 = 1e6, 11e6), as before. It stays an option, since it takes most of the GPU memory left.
+- **Larger automatic batches** (the fork runs 256 curves at a time at 1000 bits, B1 = 1e5;
+  our target is 2^17 coefficients, 128 curves there): twice the automatic batch gains 1–3%
+  at small dF and nothing at B1 = 1e6; not changed. (At 8000 bits, B1 = 1e5, twice the
+  automatic batch, forced in `bench_stage2`, exceeds the GPU memory and runs 11 times slower;
+  the automatic choice and `-batch` are capped by the memory estimate.)
 
 ## Robustness and limits
 
@@ -286,6 +331,8 @@ arithmetic; none of them is implemented.
 | M7 | Library and tests for publication: C interface (`gpuecm2.h`, `libgpuecm2`), known stage 2 hits from real factoring work, boundary tests at every size and parameter threshold, large-B2 robustness (closed-form G plans). **Done**; see docs/TESTING.md and docs/INTEGRATION.md. |
 | M8 | Integration into GMP-ECM (a patch using the C interface in `cudawrapper.c` and `ecm.c`). **Done:** `gmp-ecm/` (option `-gpu2`, `build_ecm.sh`, `test_gpu2.py`). |
 | M9 | Large moduli, step 1: up to 32768 bits (CGBN's limit) in the current design, gpuecm2 and GMP-ECM's GPU stage 1 (more kernel sizes only). **Done:** CGBN sizes per translation unit (`GPUECM2_MAX_BITS`), a memory estimate from the allocations, kernels split for the watchdog, a two-pass RNS-to-limbs conversion and memory operands in `k_step` for large sizes; tests up to 32768 bits against GMP-ECM (boundary tests, `tests/large_tests.py`, 51 stage 2 hits of repunit cofactors). Stage 2 is 80-190 times one CPU core from B1 = 1e5 (docs/BENCHMARKS.md). |
+| M10 | All-RNS polynomial arithmetic: Montgomery reduction in the RNS by base extensions instead of conversions to and from limbs. **Done** as RNS storage (`-rns`, `GPUECM2_RNS=1`, off by default): 6% more memory, stage 2 4–8% faster up to 2048 bits and 12–29% above, identical results; and the two-pass RNS-to-limbs conversion from 3072 bits on. |
+| M11 | Ideas from Greg Childers' GMP-ECM GPU fork (October 2026): the low levels of the trees and of the evaluation mod n (**done**, 1–12% depending on size and storage); root arithmetic by transforms for large N and the curve arithmetic in RNS evaluated (see Ideas evaluated). Comparison of the two in docs/BENCHMARKS.md. |
 
 ### M6 benchmarks (idle RTX 4070 Ti SUPER)
 
