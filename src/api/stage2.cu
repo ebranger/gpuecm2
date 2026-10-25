@@ -134,18 +134,19 @@ void stage2_cpu_wait(bool spin) {
 
 namespace {
 int &rns_store_setting() {
-  static int v = -1;  // -1: not set yet (the environment decides)
+  static int v = -2;  // -2: not set yet (the environment decides), -1: automatic, 0 / 1: limbs / RNS
   return v;
 }
 }  // namespace
 void stage2_set_rns_store(bool on) { rns_store_setting() = on; }
-bool stage2_rns_store() {
+void stage2_set_rns_store_auto() { rns_store_setting() = -1; }
+bool stage2_rns_store(size_t bits) {
   int &v = rns_store_setting();
-  if (v < 0) {
+  if (v == -2) {
     const char *e = getenv("GPUECM2_RNS");
-    v = e && atoi(e) != 0;
+    v = e && *e ? atoi(e) != 0 : -1;
   }
-  return v != 0;
+  return v < 0 ? bits >= STAGE2_RNS_AUTO_BITS : v != 0;
 }
 
 /* The peak is reached while G is processed block by block, with the root
@@ -154,7 +155,7 @@ size_t stage2_gpu_bytes(const mpz_t n, const Stage2Params &sp, size_t batch) {
   const size_t bits = mpz_sizeinbase(n, 2), dF = sp.dF, B = batch;
   if (dF == 0) return (size_t)256 << 20;
   /* primes (RnsContext::init) and words per coefficient: limbs, or base B (RNS storage) */
-  const bool rs = stage2_rns_store();
+  const bool rs = stage2_rns_store(bits);
   const size_t lg = clog2(2 * dF + 2), PB = (bits + 10) / 30 + 1;
   const size_t P = rs ? (bits + lg + 16) / 30 + 1 + PB : (2 * bits + lg + 2) / 30 + 2;
   const size_t nl4 = 4 * (rs ? PB : (bits + 31) / 32);
@@ -246,7 +247,7 @@ Stage2Engine::Stage2Engine(const mpz_t n, const Stage2Params &sp) : sp_(sp) {
   int want_logT = std::max(12, clog2(2 * sp.dF));
   if (const char *e = getenv("GPUECM2_MAX_LOGT"))  // testing aid: shorter NTTs force the long-product paths
     want_logT = std::max(12, std::min(want_logT, atoi(e)));
-  rns_store_ = stage2_rns_store();
+  rns_store_ = stage2_rns_store(mpz_sizeinbase(n, 2));
   if (!ctx_.init(n, 2 * sp.dF + 2, want_logT, &err_, rns_store_)) return;
   /* transient buffers come from the default stream-ordered pool; keep its
      memory between synchronisations instead of returning it to the driver

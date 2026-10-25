@@ -15,9 +15,9 @@ time than GMP-ECM on one core of an i7-14700F, for numbers of 512 to 4096 bits a
 for 4096 bits at B1 = 11e7), and 80–190 times less for numbers of 8192 to 32768 bits from
 B1 = 1e5 (e.g. 1.3 s instead of 123 s for 32768 bits at B1 = 1e6); see [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 These figures were measured before the changes of late October 2026 (the low levels of the
-product trees mod n, a faster conversion from 3072 bits on, and the `-rns` option), which
-make stage 2 a further 4–12% faster by default, and up to 1.3 times with `-rns` for large
-numbers (docs/DESIGN.md).
+product trees mod n, a faster conversion from 3072 bits on, and RNS storage of the
+polynomials from 3072 bits on), which make stage 2 a further 4–12% faster up to 2048 bits
+and 1.1–1.35 times faster above (docs/DESIGN.md).
 
 For a 1024-bit number and the B1 values from GMP-ECM's table (with GMP-ECM's
 default B2), on an RTX 4070 Ti SUPER and one core of an i7-14700F the following timings were
@@ -63,7 +63,7 @@ The library has a C interface for other programs as well; see
 
 ```
 gpuecm2 [-v] [-q] [-k n] [-power n | -dickson n] [-maxmem MB] [-no-ntt | -ntt] [-one]
-        [-selfcheck] [-treecache] [-rns] [-batch n] [-spin] -resume <file> B1 [B2 | B2min-B2max]
+        [-selfcheck] [-treecache] [-rns | -no-rns] [-batch n] [-spin] -resume <file> B1 [B2 | B2min-B2max]
 ```
 
 The options mean what they mean for `ecm` (stage 2 only). In addition:
@@ -79,13 +79,14 @@ The options mean what they mean for `ecm` (stage 2 only). In addition:
   0.4 GB at 512 bits and 0.8 GB at 1024 bits for B1 = 11e7, 1.6 GB at 1024 bits for 26e7
   (`gpuecm2 -h` has a table). It uses at most the memory left free by the rest of stage 2.
   Off by default.
-- `-rns` holds the polynomials as residues modulo a second set of NTT primes instead of
-  limbs, which halves the work of the conversions around each polynomial product
-  ([docs/DESIGN.md](docs/DESIGN.md)). The results are identical; stage 2 gets 4-8% faster
-  up to 2048 bits, 12-23% at 3072-4096 bits, 16-27% at 6144-8192 bits and 24-29% at
-  10240-32768 bits (the polynomial arithmetic alone 1.5-1.8 times from 4096 bits on; the
-  root generation is unchanged), for about 6% more GPU memory. Off by default; `GPUECM2_RNS=1` in the environment turns it
-  on, also for programs using the C interface.
+- RNS storage: from 3072 bits on, the polynomials are held as residues modulo a second set
+  of NTT primes instead of limbs, which halves the work of the conversions around each
+  polynomial product ([docs/DESIGN.md](docs/DESIGN.md)). The results are identical; stage 2
+  is 8–25% faster there (4096–32768 bits) and the GPU memory the same or up to 10% smaller.
+  Below 3072 bits it gains or loses a few percent (−6% to +9% at 512–2048 bits) for up to 5%
+  more memory, so limbs stay the default there. `-rns` and `-no-rns` force one or the other
+  for all sizes; `GPUECM2_RNS=1` or `0` in the environment does the same, also for programs
+  using the C interface.
 - Consecutive residues of the same number (as `ecm -save` and `ecm -gpu -save` write them) are
   processed together on the GPU when one curve alone cannot keep it busy (B1 below about 1e7).
   `-batch n` sets the number of residues per batch (default: automatic; `-batch 1` turns

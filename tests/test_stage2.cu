@@ -41,10 +41,11 @@ static void set_env(const char *name, const char *value) {
 
 /* the same random curves (a batch) with limbs and with RNS storage */
 static void compare_rns(const MontgomeryCurve &C0, const Stage2Params &sp, gmp_randstate_t rs, const char *tag) {
+  stage2_set_rns_store(false);
   Stage2Engine eng(C0.n.get(), sp);
   stage2_set_rns_store(true);
   Stage2Engine engr(C0.n.get(), sp);
-  stage2_set_rns_store(false);
+  stage2_set_rns_store_auto();
   char what[240];
   const int bits = (int)mpz_sizeinbase(C0.n.get(), 2);
   if (!eng.ok() || !engr.ok() || !engr.rns().rns_store()) {
@@ -110,7 +111,7 @@ static void compare_zn(const MontgomeryCurve &C0, const Stage2Params &sp, gmp_ra
       check(ok, what);
     }
   }
-  stage2_set_rns_store(false);
+  stage2_set_rns_store_auto();
 }
 
 static void run_case(int bits, double B1, int S) {

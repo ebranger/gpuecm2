@@ -45,14 +45,21 @@ struct Stage2Outcome {
    GPU work. */
 void stage2_cpu_wait(bool spin);
 
-/* How the polynomials' coefficients are held on the GPU: false (default)
-   as limbs of residues mod n, true in RNS storage (gpu/rns.h: residues mod a
-   second set of NTT primes, which halves the conversion work around each
-   product; about 7% more GPU memory). The results are identical. Taken by an
-   engine when it is made, and by the memory estimates. The environment
-   variable GPUECM2_RNS=1 makes true the default. */
+/* How the polynomials' coefficients are held on the GPU: as limbs of residues
+   mod n, or in RNS storage (gpu/rns.h: residues mod a second set of NTT
+   primes, which halves the conversion work around each product; a few percent
+   more or less GPU memory). The results are identical. By default the choice
+   is automatic: RNS storage for moduli of STAGE2_RNS_AUTO_BITS bits and more,
+   where it made stage 2 8-25% faster with no more memory, limbs below (where
+   it gains or loses a few percent). stage2_set_rns_store forces one of them
+   for all sizes, the environment variable GPUECM2_RNS=1 or 0 likewise (also
+   for programs using the C interface). Taken by an engine when it is made,
+   and by the memory estimates. */
+constexpr size_t STAGE2_RNS_AUTO_BITS = 3072;
 void stage2_set_rns_store(bool on);
-bool stage2_rns_store();
+void stage2_set_rns_store_auto();
+/* whether RNS storage is used for moduli of `bits` bits */
+bool stage2_rns_store(size_t bits);
 
 /* Rough upper estimate of the GPU memory (bytes) a stage 2 run of `batch`
    curves needs. */

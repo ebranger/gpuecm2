@@ -200,14 +200,15 @@ def cases(heavy, maxbits=32768):
     # modulus sizes (dF = 256 at the default B2 for B1 = 1e4)
     sizes = [64, 100, 256, 487, 490, 511, 512, 513, 767, 768, 769, 992, 993, 1014, 1017, 1023, 1024, 1025, 1280, 1281,
              1536, 1537, 1792, 1793, 1912, 1916, 1920, 1921, 2048, 2049, 2253, 2254, 2257, 2258, 2560, 2561,
-             3072, 3073, 3552, 3553, 3584, 3585, 4008, 4032, 4096, 4097, 4504, 4527, 4576, 4577, 4607, 4608,
+             3071, 3072, 3073, 3552, 3553, 3584, 3585, 4008, 4032, 4096, 4097, 4504, 4527, 4576, 4577, 4607, 4608,
              4609, 5120, 5121, 6144, 6145, 7168, 7169, 8192, 8193, 10240, 10241, 12288, 12289, 14336, 14337,
              16384, 16385, 20480, 20481, 24576, 24577, 28672, 28673, 32767, 32768]
     sizes = [b for b in sizes if b <= maxbits]  # a build for smaller moduli (GPUECM2_MAX_BITS)
     for bits in sizes:
         add(f"size/{bits}", lambda R, bits=bits: compare(R, R.residues(bits, 2), "1873422"))
-    # larger polynomials (dF = 16384) at the sizes where the conversions switch tiles
-    for bits in (512, 992, 993, 1920, 1921, 2254, 2258, 3552, 3553, 4576, 4577, 4608):
+    # larger polynomials (dF = 16384) at the sizes where the conversions switch tiles,
+    # and where the storage switches to RNS (3072 bits)
+    for bits in (512, 992, 993, 1920, 1921, 2254, 2258, 3071, 3072, 3552, 3553, 4576, 4577, 4608):
         add(f"size-dF16384/{bits}", lambda R, bits=bits: compare(R, R.residues(bits, 1), "5706890290",
                                                                 ["-dickson", "6"]))
     add(f"size/{maxbits + 1}-refused", lambda R: refused(R, R.residues(maxbits + 1, 1), "1873422"))

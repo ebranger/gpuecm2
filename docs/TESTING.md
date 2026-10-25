@@ -104,7 +104,9 @@ its code path or a discrete parameter, so that off-by-one errors and edge effect
 - Modulus sizes: each size of the CGBN ladder (512, 768, ..., 2048, 2560, ..., 4608, 5120, ...,
   8192, 10240, ..., 16384, 20480, ..., 32768 bits) and one bit more; GMP-ECM's NTT threshold
   (1920/1921 bits, where dF stops being a power of two); the switches of the RNS-to-limbs
-  conversion tile (2254/2258 and 4576/4577 bits); sizes where the RNS primes leave no spare bit
+  conversion tile (2254/2258 and 4576/4577 bits); the switch to RNS storage (3071/3072 bits,
+  also at dF = 16384) and those of the number of low levels mod n (6144/6145, 12288/12289
+  bits); sizes where the RNS primes leave no spare bit
   over the CRT bound (e.g. 1017, 1916, 4008, 4504 bits), with N close to 2^bits; tiny moduli
   (64 bits); 4608 bits at small and larger dF; the largest size of the build (8192 bits by
   default, 32768 at most; `gpuecm2 -h` shows it, and the sizes above it are left out), and one
@@ -168,11 +170,13 @@ reports it as a known difference); all other results tested agree exactly.
 
 ## RNS storage
 
-`-rns` (or `GPUECM2_RNS=1` in the environment, which every script and the C interface pass
-on) changes how the polynomial arithmetic holds its data, not what it computes, so the whole
-suite applies to it unchanged: `GPUECM2_RNS=1 ctest`, `tests/run_hits.py <gpuecm2> -rns
--selfcheck` (and with `capi_resume` and the environment variable), the large hits and
-`large_tests.py check`, `boundary_tests.py`. In addition `test_polyalg` runs every case in
+RNS storage (the default from 3072 bits on; `-rns` / `-no-rns`, or `GPUECM2_RNS=1` / `0` in
+the environment, which every script and the C interface pass on, force it on or off for all
+sizes) changes how the polynomial arithmetic holds its data, not what it computes, so the
+whole suite applies to it unchanged; it is run three times: with the default, with
+`GPUECM2_RNS=0` and with `GPUECM2_RNS=1` (`ctest`, `tests/run_hits.py <gpuecm2>
+-selfcheck`, with `capi_resume` too, the large hits and `large_tests.py check`,
+`boundary_tests.py`). In addition `test_polyalg` runs every case in
 both storages, and `test_stage2` runs batches of random curves through an engine of each
 kind and requires the same products H(-f_i) for every curve (plain, with the self-check,
 with the tree cache, and with the long-product fallback of `GPUECM2_MAX_LOGT=12`), and the
@@ -202,6 +206,7 @@ Environment variables read by the stage 2 engine (for tests only):
 - `GPUECM2_TREE_CACHE_LEVELS=n`: with `-treecache`, keep the transforms of at most n tree
   levels (tests the evaluation's switch between kept and recomputed levels).
 - `GPUECM2_DEBUG=1`: print the root generation plan.
-- `GPUECM2_RNS=1`: RNS storage of the polynomials (as `-rns`; also for the C interface).
+- `GPUECM2_RNS=1` / `0`: RNS storage of the polynomials for all sizes / for none (as `-rns` /
+  `-no-rns`; also for the C interface). Unset: RNS storage from 3072 bits on.
 - `GPUECM2_ZN_LEVELS=z`: do the lowest z levels of the product trees and of the evaluation
   mod n (0: none; the default depends on the size and the storage, docs/DESIGN.md).

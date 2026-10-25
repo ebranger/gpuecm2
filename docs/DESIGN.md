@@ -109,8 +109,9 @@ The C interface is shaped so that GMP-ECM can call it from its per-curve stage 2
   - Tried and rejected (M6): the same products as int8 tensor-core GEMMs (bytes of limbs ×
     bytes of constants, exact in int32). With the short inner dimension (4 × limbs) a WMMA
     kernel reached only 13–22 T MAC/s, no faster than the CUDA-core kernels.
-- **RNS storage (option `-rns`, off by default):** the polynomial arrays hold, instead of
-  limbs, residues modulo a second set of the NTT primes, so that the conversions around each
+- **RNS storage (the default from 3072 bits on; `-rns` / `-no-rns` for all sizes or none):**
+  the polynomial arrays hold, instead of limbs, residues modulo a second set of the NTT
+  primes, so that the conversions around each
   product become base extensions between residue systems (`src/gpu/rns.h`, `rns.cu`).
   - The primes are split into base A (the first P_A) and base B (the other P_B), with
     M_A > 2^15 L N and M_B > 2^9 N (P_A + P_B is P to P + 2). A coefficient c is stored as
@@ -143,6 +144,16 @@ The C interface is shaped so that GMP-ECM can call it from its per-curve stage 2
     1e5), 1.27 at 24576 (1e5), 1.27/1.28 at 32768 (1e4, 1e5). At 8192 bits and B1 = 1e6 the polynomial phases go from 68.8 to 47.5
     ms per curve, the root generation (29 ms) is unchanged; the conversions are still 2.6
     times the NTTs.
+  - Memory and the default (measured with the Z/N levels, GMP-ECM's parameters, peak of the
+    GPU memory pool, limbs → RNS storage): up to 2048 bits 0–5% more (one curve at 11e7:
+    375 → 392 MB at 512 bits, 741 → 774 MB at 1024, 2428 → 2517 MB at 2048), from 4096 bits
+    the same or less (one curve 4–10% less: 1095 → 1012 MB at 4096 bits, B1 = 11e6; 637 → 570
+    MB at 16384 bits, 1e6; batches about equal), because the limb path's two-pass conversion
+    needs a scratch buffer and RNS storage's reduction does not. Stage 2 with RNS storage:
+    0.94–1.04 at 512 bits, 0.95–1.06 at 1024, 0.99–1.09 at 2048, 1.08–1.19 at 4096,
+    1.17–1.22 at 8192, 1.19–1.21 at 16384, 1.23–1.25 at 32768 bits (B1 = 1e4 to 11e7; at
+    32768 bits and B1 = 1e4, dF = 256, 0.91: too few coefficients for the extension
+    kernels). Hence the automatic choice from 3072 bits.
   - Tried and rejected: summing two products in 64 bits before each 96-bit addition in the
     tiles (fewer additions per multiply-add): 4-20% slower in all conversion kernels.
 - **Low levels mod n** (`ZnLevels`; an idea from the GPU stage 2 of Greg Childers' GMP-ECM
@@ -331,7 +342,7 @@ storage, above); the others are not.
 | M7 | Library and tests for publication: C interface (`gpuecm2.h`, `libgpuecm2`), known stage 2 hits from real factoring work, boundary tests at every size and parameter threshold, large-B2 robustness (closed-form G plans). **Done**; see docs/TESTING.md and docs/INTEGRATION.md. |
 | M8 | Integration into GMP-ECM (a patch using the C interface in `cudawrapper.c` and `ecm.c`). **Done:** `gmp-ecm/` (option `-gpu2`, `build_ecm.sh`, `test_gpu2.py`). |
 | M9 | Large moduli, step 1: up to 32768 bits (CGBN's limit) in the current design, gpuecm2 and GMP-ECM's GPU stage 1 (more kernel sizes only). **Done:** CGBN sizes per translation unit (`GPUECM2_MAX_BITS`), a memory estimate from the allocations, kernels split for the watchdog, a two-pass RNS-to-limbs conversion and memory operands in `k_step` for large sizes; tests up to 32768 bits against GMP-ECM (boundary tests, `tests/large_tests.py`, 51 stage 2 hits of repunit cofactors). Stage 2 is 80-190 times one CPU core from B1 = 1e5 (docs/BENCHMARKS.md). |
-| M10 | All-RNS polynomial arithmetic: Montgomery reduction in the RNS by base extensions instead of conversions to and from limbs. **Done** as RNS storage (`-rns`, `GPUECM2_RNS=1`, off by default): 6% more memory, stage 2 4–8% faster up to 2048 bits and 12–29% above, identical results; and the two-pass RNS-to-limbs conversion from 3072 bits on. |
+| M10 | All-RNS polynomial arithmetic: Montgomery reduction in the RNS by base extensions instead of conversions to and from limbs. **Done** as RNS storage (identical results), the default from 3072 bits on (`STAGE2_RNS_AUTO_BITS`), where stage 2 gets 8–25% faster with the same or up to 10% less GPU memory; below, where it gains or loses a few percent for up to 5% more memory, limbs stay the default (`-rns` / `-no-rns`, `GPUECM2_RNS=1` / `0` force either); and the two-pass RNS-to-limbs conversion from 3072 bits on. |
 | M11 | Ideas from Greg Childers' GMP-ECM GPU fork (October 2026): the low levels of the trees and of the evaluation mod n (**done**, 1–12% depending on size and storage); root arithmetic by transforms for large N and the curve arithmetic in RNS evaluated (see Ideas evaluated). Comparison of the two in docs/BENCHMARKS.md. |
 
 ### M6 benchmarks (idle RTX 4070 Ti SUPER)
