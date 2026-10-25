@@ -331,3 +331,75 @@ Running stage 1 on CPU cores and only stage 2 on the GPU also works (gpuecm2 rea
 residues of any GMP-ECM run); the GPU then idles at the default B2 and a larger B2 (`ecm`'s
 B2 argument, the same for gpuecm2) makes better use of it. Such B2 values are tested against
 GMP-ECM (docs/TESTING.md: full B2 up to 1e13, B2min–B2 ranges up to 1e39).
+
+## Comparison with Greg Childers' GMP-ECM GPU fork (October 2026)
+
+Greg Childers' fork of GMP-ECM (github.com/gchilders/gmp-ecm, branch `gpu-stage1-dynamic`,
+commit bbb6b40 of 2026-10-23) replaces the GPU stage 1 (its own run-time sized arithmetic
+instead of CGBN) and adds a GPU stage 2 that, by its design notes, follows gpuecm2's ideas
+with its own code: GMP-ECM's FFT continuation with polynomials in RNS form, batched NTTs and
+batched curves. It handles `-param 3` only and always uses GMP-ECM's NTT parameters (dF a
+power of 2), so above 1920 bits gpuecm2 was run with `-ntt` for the same parameters. Both
+ran on the same RTX 4070 Ti SUPER on 2026-10-24/25 (the fork built for sm_89 with CUDA
+13.3); the scripts and logs are kept outside the repository.
+
+Both give the same results: with the same sigmas the "Product of G(f_i)" values were
+identical for every curve compared (64 curves each at 500, 1000, 2000, 4000 and 8000 bits,
+32 each at 16000 and 32000 bits).
+
+End to end (`ecm -gpu` of the fork against GMP-ECM 7.0.6 `-gpu2` with gpuecm2 a6f2151 in
+its default limb mode; each with its own number of curves: the fork 16896 at 500 bits down
+to 528 at 16000–32000 bits, GMP-ECM 4224; wall time per curve; ratio > 1: the fork is faster):
+
+| N bits | B1 = 1e4 | 1e5 | 1e6 | 1e7 |
+|---|---|---|---|---|
+| 500 | 2.42 | 2.42 | 2.61 | 2.66 |
+| 1000 | 1.43 | 1.39 | 1.45 | 1.33 |
+| 2000 | 1.05 | 1.06 | 0.99 | 1.09 |
+| 4000 | 0.90 | 0.98 | | |
+| 8000 | 0.87 | 0.84 | | |
+| 16000 | 0.90 | | | |
+| 32000 | 0.84 | | | |
+
+Most of the difference at small sizes is stage 1 (per curve, GMP-ECM's CGBN kernels against
+the fork's: 5.0–6.0 times as long at 500 bits, 1.6–1.9 at 1000, 1.05–1.24 at 2000, 0.96–1.07
+at 4000–16000 and 0.78 at 32000 bits): the fork computes small numbers with one thread per
+curve (up to about 900 bits), where CGBN uses a group of 4–8 threads.
+
+Stage 2 alone, on identical residues (the fork's stage 1 saved with `-save`, resumed by
+both with the same parameters; time per curve from the wall time of the whole resume less
+the time of a one-residue run; ratio = fork time / gpuecm2 time, > 1: gpuecm2 is faster),
+gpuecm2 a6f2151 and with the low levels mod n (this version), limbs and `-rns`:
+
+| N bits | B1 | dF, k | curves | fork | gpuecm2, limbs / `-rns` | ratio a6f2151, limbs / `-rns` | ratio now, limbs / `-rns` |
+|---|---|---|---|---|---|---|---|
+| 500 | 1e4 | 256, 3 | 16896 | 0.14 ms | 0.176 / 0.173 ms | 0.82 / 0.81 | 0.80 / 0.81 |
+| 500 | 1e5 | 1024, 4 | 8448 | 0.317 ms | 0.379 / 0.385 ms | 0.83 / 0.77 | 0.84 / 0.82 |
+| 500 | 1e6 | 4096, 6 | 2112 | 1.98 ms | 2.21 / 2.32 ms | 0.87 / 0.82 | 0.90 / 0.85 |
+| 500 | 1e7 | 32768, 3 | 528 | 16.8 ms | 16.1 / 16.8 ms | 1.02 / 0.99 | 1.04 / 1.00 |
+| 1000 | 1e4 | 256, 3 | 1024 | 0.225 ms | 0.244 / 0.273 ms | 1.00 / 0.83 | 0.92 / 0.82 |
+| 1000 | 1e5 | 1024, 4 | 4224 | 0.691 ms | 0.791 / 0.765 ms | 0.85 / 0.85 | 0.87 / 0.90 |
+| 1000 | 1e6 | 4096, 6 | 1056 | 5.01 ms | 5.26 / 5.08 ms | 0.90 / 0.95 | 0.95 / 0.99 |
+| 1000 | 1e7 | 32768, 3 | 264 | 41.5 ms | 38.2 / 37.1 ms | 1.03 / 1.08 | 1.09 / 1.12 |
+| 2000 | 1e4 | 256, 3 | 4224 | 0.492 ms | 0.5 / 0.502 ms | 0.91 / 0.98 | 0.99 / 0.98 |
+| 2000 | 1e5 | 1024, 4 | 2112 | 2.14 ms | 1.87 / 1.86 ms | 1.03 / 1.09 | 1.14 / 1.15 |
+| 2000 | 1e6 | 4096, 6 | 528 | 15.8 ms | 14.3 / 13.9 ms | 1.08 / 1.13 | 1.10 / 1.13 |
+| 2000 | 1e7 | 32768, 3 | 264 | 114 ms | 111 / 108 ms | 1.00 / 1.04 | 1.03 / 1.06 |
+| 4000 | 1e4 | 256, 3 | 2112 | 1.51 ms | 1.2 / 1.11 ms | 1.08 / 1.28 | 1.26 / 1.36 |
+| 4000 | 1e5 | 1024, 4 | 1056 | 7.34 ms | 5.48 / 4.69 ms | 1.24 / 1.48 | 1.34 / 1.57 |
+| 8000 | 1e4 | 256, 3 | 1056 | 4.33 ms | 3.59 / 3.19 ms | 1.13 / 1.34 | 1.21 / 1.36 |
+| 8000 | 1e5 | 1024, 4 | 544 | 26 ms | 16.9 / 14.3 ms | 1.45 / 1.79 | 1.53 / 1.82 |
+| 16000 | 1e4 | 256, 3 | 544 | 12.5 ms | 11.5 / 10.1 ms | 1.04 / 1.25 | 1.09 / 1.24 |
+| 32000 | 1e4 | 256, 3 | 288 | 46.4 ms | 39.8 / 43.6 ms | 1.10 / 1.08 | 1.16 / 1.06 |
+
+(The ratios of a6f2151 are those of an earlier run, with the fork's times of that run.)
+With the low levels mod n, gpuecm2's stage 2 is as fast as the fork's at 2000 bits for
+B1 = 1e4 and 3–15% faster for larger B1, and 1.1–1.5 times faster from 4000 to 32000 bits
+(1.06–1.82 times with `-rns`, most at 4000–8000 bits). The fork stays ahead at 500–1000
+bits for small and medium B1 (by 1–20%), and gpuecm2 is ahead at B1 = 1e7 (dF = 32768). Inside the fork, its low levels mod n are worth 12–21% of its stage
+2 at 500–2000 bits (`GMPECM_S2POLY_LOWMAX=0 GMPECM_S2POLY_MPMAX=0` turns them off), its tree
+cache 2–3%; its RNS levels without them are slower than gpuecm2's, which is why the same
+idea gains less in gpuecm2 (docs/DESIGN.md). Its root generation is about 10% faster than
+gpuecm2's at 1000 bits, B1 = 1e6; at 16000–32000 bits it uses products by transforms for the
+roots (docs/DESIGN.md, Ideas evaluated), which these small-B1 runs (x^1, dF = 256) hardly
+exercise.
