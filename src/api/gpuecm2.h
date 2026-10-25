@@ -110,7 +110,8 @@ int gpuecm2_curve_from_sigma(mpz_t f, mpz_t A, mpz_t x0, int param, const mpz_t 
 /* Select the CUDA device (call before the other functions); 0 on success. */
 int gpuecm2_set_device(int device);
 /* How the calling thread waits for the GPU: 0 (default) sleeps, leaving the
-   core to other work such as CPU stage 1; 1 busy-waits. Call first. */
+   core to other work such as CPU stage 1; 1 busy-waits. Call first. (Under
+   WSL2 the CUDA driver polls in both cases, so the thread keeps a core busy.) */
 void gpuecm2_cpu_wait(int spin);
 
 const char *gpuecm2_version(void);

@@ -39,7 +39,8 @@ struct Stage2Outcome {
   Stage2Times t;
 };
 
-/* How the CPU waits for the GPU: false (default) sleeps until the GPU is
+/* How the CPU waits for the GPU (under WSL2 the CUDA driver polls in both
+   cases, keeping a core busy): false (default) sleeps until the GPU is
    done, leaving the core to other work such as CPU stage 1; true
    busy-waits (a full core, slightly lower latency). Call before any other
    GPU work. */

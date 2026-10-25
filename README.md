@@ -96,8 +96,11 @@ The options mean what they mean for `ecm` (stage 2 only). In addition:
 - The GPU memory needed grows with dF, not with k. If GMP-ECM's dF does not fit, gpuecm2 uses
   the parameters GMP-ECM would choose with the smallest larger `-k` that fits (more, smaller
   blocks, still covering B2) and prints a note.
-- While the GPU works the CPU thread sleeps, so all cores stay available for CPU stage 1;
-  `-spin` busy-waits instead (no measurable speed difference on the test system).
+- While the GPU works, the CPU thread waits in blocking mode: on native Linux it sleeps, so
+  the core stays available for CPU stage 1. Under WSL2 the CUDA driver polls the GPU even
+  then, so the waiting thread keeps one core busy (about half of it as kernel time, which
+  GMP-ECM's "CPU time", user time only, does not show). `-spin` busy-waits in user space (no
+  measurable speed difference on the test system).
 
 Limits: odd numbers of up to 8192 bits, or up to 32768 bits with a build for larger numbers
 (see [Build](#build); other residues are skipped with a message); any B2
