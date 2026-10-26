@@ -24,13 +24,24 @@ namespace {
 constexpr int BLOCK = 256;
 /* k_step occupancy: with 4-5 limbs per thread it needs ~126 registers (2
    blocks per SM); limiting it to 80 (3 blocks) is ~4% faster despite small
-   spills (measured at 1024 bits). Other sizes are left to the compiler. */
+   spills (measured at 1024 bits). With 8-16 limbs per thread (3072, 4096-8192
+   and 10240-16384 bits) it needs up to 220 (1 block); limiting it to 128 (2
+   blocks) is 0.5-4% faster at 3072-8192 bits and the same at 16384 bits. With
+   32 limbs per thread (32768 bits) the spills make that 36% slower. The other
+   sizes are left to the compiler. */
 constexpr int step_min_blocks(uint32_t tpi, uint32_t bits) {
-  return (bits / 32 / tpi == 4 || bits / 32 / tpi == 5) ? 3 : 1;
+  return (bits / 32 / tpi == 4 || bits / 32 / tpi == 5) ? 3 : (bits / 32 / tpi >= 8 && bits / 32 / tpi <= 16) ? 2 : 1;
+}
+/* the same for the affine steps' kernels (k_w_pre, k_w_post: up to 214
+   registers with 16 limbs per thread): 2 blocks for 8-16 limbs per thread,
+   1-4% faster */
+constexpr int aff_min_blocks(uint32_t tpi, uint32_t bits) {
+  return (bits / 32 / tpi >= 8 && bits / 32 / tpi <= 16) ? 2 : 1;
 }
 
-/* device constants: n (plain), the rest in Montgomery form */
-enum { C_N = 0, C_A, C_D, C_AM, C_C3, C_ONE, C_PX, C_PY, C_PZ, C_PT, C_COUNT };
+/* device constants: n (plain), the rest in Montgomery form (C_AW: the a of
+   GMP-ECM's Weierstrass model y^2 = x^3 + a x + b, for the affine steps) */
+enum { C_N = 0, C_A, C_D, C_AM, C_C3, C_ONE, C_PX, C_PY, C_PZ, C_PT, C_AW, C_COUNT };
 
 template <uint32_t TPI, uint32_t BITS>
 struct K {
@@ -317,9 +328,9 @@ __global__ void k_chunk_back(const cgbn_mem_t<BITS> *cur, uint32_t np0, const cg
   for (size_t i = end; i-- > start;) {
     if (i > start) cgbn_load(E.env, prev, mp(&PRE[i - 1]));
     else cgbn_set(E.env, prev, one);
+    cgbn_load(E.env, z, mp(&V[i]));  // (before INV[i] is written: INV may be V)
     E.mul(r, I, prev);
     cgbn_store(E.env, &INV[i], r);
-    cgbn_load(E.env, z, mp(&V[i]));
     if (E.is_zero(z)) cgbn_set(E.env, z, one);
     E.mul(I, I, z);
   }
@@ -388,6 +399,375 @@ __global__ void k_test_ops(const cgbn_mem_t<BITS> *cur, uint32_t np0, cgbn_mem_t
   store_pt(E, R, &io[19], &io[20], &io[21], &io[22], 0);
 }
 
+
+/* ------------------------------------------------ affine Weierstrass steps */
+/* With RootPlanGPU::affine the progression steps add affine points of
+   GMP-ECM's Weierstrass model (x = (3u + A)/(3B), y = v/B; y^2 = x^3 + a x +
+   b) with one batched inversion of all the step's denominators x2 - x1 (2 y1
+   for a doubling): about 6 products per addition instead of about 10, and
+   the roots are the x values themselves (no inversion and conversion per
+   block). The tables start as the Edwards points of the scalar
+   multiplications and are converted once. A step is k_w_pre (the roots, the
+   denominators' prefix products and the first levels of the inversion's
+   product tree), k_tree_up to one value, its inverse on the host,
+   k_tree_down and k_w_post (the inverses and the additions). The batch
+   inversion makes a step latency-bound (multiplication chains, a round trip
+   to the host): it needs more progressions than the Edwards steps, and
+   gains where the polynomial work of the other stream fills the GPU. */
+
+/* D[i] = (Z - Y) X for table point i (Edwards): its x_W and y_W have the
+   denominator 3B D. *flag := 1 if some D is zero (the neutral element or the
+   point of order 2: not affine). */
+template <uint32_t TPI, uint32_t BITS>
+__global__ void k_w_den(const cgbn_mem_t<BITS> *cur, uint32_t np0, size_t per, size_t total,
+                        const cgbn_mem_t<BITS> *FX, const cgbn_mem_t<BITS> *FY, const cgbn_mem_t<BITS> *FZ,
+                        cgbn_mem_t<BITS> *D, int *flag) {
+  typedef K<TPI, BITS> T;
+  const size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) / TPI;
+  if (i >= total) return;
+  cur += (i / per) * C_COUNT;
+  typename T::ctx_t ctx(cgbn_no_checks);
+  typename T::Env E(ctx, &cur[C_N], np0);
+  typename T::bn_t x, y, z, t;
+  cgbn_load(E.env, x, mp(&FX[i]));
+  cgbn_load(E.env, y, mp(&FY[i]));
+  cgbn_load(E.env, z, mp(&FZ[i]));
+  E.sub(t, z, y);
+  E.mul(t, t, x);
+  if (E.is_zero(t) && (threadIdx.x % TPI) == 0) *flag = 1;
+  cgbn_store(E.env, &D[i], t);
+}
+
+/* table point i -> affine Weierstrass: x = (3(Z+Y) + A(Z-Y)) X c3 / D,
+   y = 3 (Z+Y) Z c3 / D (c3 = 1/(3B), INV = 1/D), into both table copies
+   (which may be FX, FY, FZ and a fourth buffer: each value is read before
+   it is written) */
+template <uint32_t TPI, uint32_t BITS>
+__global__ void k_w_conv(const cgbn_mem_t<BITS> *cur, uint32_t np0, size_t per, size_t total,
+                         const cgbn_mem_t<BITS> *FX, const cgbn_mem_t<BITS> *FY, const cgbn_mem_t<BITS> *FZ,
+                         const cgbn_mem_t<BITS> *INV, cgbn_mem_t<BITS> *AX0, cgbn_mem_t<BITS> *AY0,
+                         cgbn_mem_t<BITS> *AX1, cgbn_mem_t<BITS> *AY1) {
+  typedef K<TPI, BITS> T;
+  const size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) / TPI;
+  if (i >= total) return;
+  cur += (i / per) * C_COUNT;
+  typename T::ctx_t ctx(cgbn_no_checks);
+  typename T::Env E(ctx, &cur[C_N], np0);
+  typename T::bn_t x, y, z, s, d, t, k;
+  cgbn_load(E.env, x, mp(&FX[i]));
+  cgbn_load(E.env, y, mp(&FY[i]));
+  cgbn_load(E.env, z, mp(&FZ[i]));
+  cgbn_load(E.env, k, mp(&INV[i]));
+  cgbn_load(E.env, t, mp(&cur[C_C3]));
+  E.mul(k, k, t);  // c3 / D
+  E.add(s, z, y);
+  E.sub(d, z, y);
+  E.add(t, s, s);
+  E.add(s, t, s);  // 3 (Z + Y)
+  cgbn_load(E.env, t, mp(&cur[C_AM]));
+  E.mul(t, t, d);
+  E.add(t, t, s);  // 3 (Z+Y) + A (Z-Y)
+  E.mul(t, t, x);
+  E.mul(t, t, k);
+  cgbn_store(E.env, &AX0[i], t);
+  cgbn_store(E.env, &AX1[i], t);
+  E.mul(s, s, z);
+  E.mul(s, s, k);
+  cgbn_store(E.env, &AY0[i], s);
+  cgbn_store(E.env, &AY1[i], s);
+}
+
+/* The denominators of step n, to find the factor when its batch inversion
+   fails: for addition e (entry i += entry i+1 of a progression, as in k_step)
+   x2 - x1, or 2 y1 if the points are equal (a doubling); entry 0 before the
+   step is the root of slot sl (as in k_step), written to OX. *flag := 1 if
+   the points are opposite (the result is the point at infinity, not affine). */
+template <uint32_t TPI, uint32_t BITS>
+__global__ void k_w_prep(const cgbn_mem_t<BITS> *cur, uint32_t np0, const cgbn_mem_t<BITS> *RX,
+                         const cgbn_mem_t<BITS> *RY, int S, size_t nprog, size_t ncurves, size_t n, const int32_t *slot,
+                         const int64_t *sbase, int64_t sinc, size_t count, size_t blen, size_t nring,
+                         cgbn_mem_t<BITS> *OX, cgbn_mem_t<BITS> *DEN, int *flag) {
+  typedef K<TPI, BITS> T;
+  const size_t e = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) / TPI;
+  if (e >= nprog * S * ncurves) return;
+  const size_t cp = e / S;
+  const int i = (int)(e - cp * S);
+  const size_t cv = cp / nprog, p = cp - cv * nprog;
+  const size_t base = cp * (S + 1) + i;
+  cur += cv * C_COUNT;
+  typename T::ctx_t ctx(cgbn_no_checks);
+  typename T::Env E(ctx, &cur[C_N], np0);
+  typename T::bn_t x1, x2, y1, y2, t;
+  cgbn_load(E.env, x1, mp(&RX[base]));
+  cgbn_load(E.env, x2, mp(&RX[base + 1]));
+  if (i == 0) {
+    int64_t sl = slot ? (int64_t)slot[n * nprog + p] : sbase[p] + (int64_t)n * sinc;
+    if (!slot && sl >= (int64_t)count) sl = -1;
+    if (sl >= 0) {
+      const size_t blk = (size_t)sl / blen, o = ((blk % nring) * ncurves + cv) * blen + ((size_t)sl - blk * blen);
+      cgbn_store(E.env, &OX[o], x1);
+    }
+  }
+  E.sub(t, x2, x1);
+  if (E.is_zero(t)) {
+    cgbn_load(E.env, y1, mp(&RY[base]));
+    cgbn_load(E.env, y2, mp(&RY[base + 1]));
+    if (cgbn_equals(E.env, y1, y2) && !E.is_zero(y1)) {
+      E.add(t, y1, y1);
+    } else {
+      if ((threadIdx.x % TPI) == 0) *flag = 1;
+      cgbn_load(E.env, t, mp(&cur[C_ONE]));
+    }
+  }
+  cgbn_store(E.env, &DEN[e], t);
+}
+
+/* Block-level product trees, for the batch inversion of the affine steps:
+   one value per instance (IPB = BLOCK / TPI instances per block), the nodes
+   in heap order (node 1 the root, leaf t at IPB + t) in N, 2 IPB values per
+   block, and their inverses in IN. Depth log2(IPB) multiplications, where a
+   chunked prefix product has depth IPB: on large sizes the latency of one
+   multiplication by one group of threads is ~20 us (8192 bits). All threads
+   of the block take part (no early return). */
+template <uint32_t TPI, uint32_t BITS>
+__device__ void tree_up(typename K<TPI, BITS>::Env &E, const typename K<TPI, BITS>::bn_t &v, cgbn_mem_t<BITS> *N,
+                        int t) {
+  constexpr int IPB = BLOCK / TPI;
+  typename K<TPI, BITS>::bn_t a, b;
+  cgbn_store(E.env, &N[IPB + t], v);
+  for (int h = IPB / 2; h >= 1; h /= 2) {
+    __syncthreads();
+    if (t < h) {
+      cgbn_load(E.env, a, &N[2 * (h + t)]);
+      cgbn_load(E.env, b, &N[2 * (h + t) + 1]);
+      E.mul(a, a, b);
+      cgbn_store(E.env, &N[h + t], a);
+    }
+  }
+  __syncthreads();
+}
+
+/* from IN[1] = 1/N[1] (written before the call): r := the inverse of leaf t */
+template <uint32_t TPI, uint32_t BITS>
+__device__ void tree_down(typename K<TPI, BITS>::Env &E, const cgbn_mem_t<BITS> *N, cgbn_mem_t<BITS> *IN, int t,
+                          typename K<TPI, BITS>::bn_t &r) {
+  constexpr int IPB = BLOCK / TPI;
+  typename K<TPI, BITS>::bn_t b;
+  for (int h = 1; h < IPB; h *= 2) {  // the nodes 2h .. 4h-1 from their parents
+    __syncthreads();
+    if (t < 2 * h) {
+      const int c = 2 * h + t;
+      cgbn_load(E.env, r, mp(&IN[c >> 1]));
+      cgbn_load(E.env, b, mp(&N[c ^ 1]));
+      E.mul(r, r, b);
+      cgbn_store(E.env, &IN[c], r);
+    }
+  }
+  __syncthreads();
+  cgbn_load(E.env, r, &IN[IPB + t]);
+}
+
+/* a level of the batch inversion: TOT[block] := the product of the block's
+   IPB values of V (count values; past the end: 1) */
+template <uint32_t TPI, uint32_t BITS>
+__global__ void k_tree_up(const cgbn_mem_t<BITS> *cur, uint32_t np0, const cgbn_mem_t<BITS> *V, size_t count,
+                          cgbn_mem_t<BITS> *NODES, cgbn_mem_t<BITS> *TOT) {
+  typedef K<TPI, BITS> T;
+  constexpr int IPB = BLOCK / TPI;
+  const int t = threadIdx.x / TPI;
+  const size_t i = (size_t)blockIdx.x * IPB + t;
+  typename T::ctx_t ctx(cgbn_no_checks);
+  typename T::Env E(ctx, &cur[C_N], np0);
+  typename T::bn_t v;
+  cgbn_load(E.env, v, mp(i < count ? &V[i] : &cur[C_ONE]));
+  cgbn_mem_t<BITS> *N = NODES + (size_t)blockIdx.x * 2 * IPB;
+  tree_up<TPI, BITS>(E, v, N, t);
+  if (t == 0) {
+    cgbn_load(E.env, v, &N[1]);
+    cgbn_store(E.env, &TOT[blockIdx.x], v);
+  }
+}
+
+/* and back: INV[i] := 1/V[i] from INVTOT[block] = 1/TOT[block] */
+template <uint32_t TPI, uint32_t BITS>
+__global__ void k_tree_down(const cgbn_mem_t<BITS> *cur, uint32_t np0, const cgbn_mem_t<BITS> *NODES,
+                            cgbn_mem_t<BITS> *INVN, const cgbn_mem_t<BITS> *INVTOT, size_t count,
+                            cgbn_mem_t<BITS> *INV) {
+  typedef K<TPI, BITS> T;
+  constexpr int IPB = BLOCK / TPI;
+  const int t = threadIdx.x / TPI;
+  const size_t i = (size_t)blockIdx.x * IPB + t;
+  typename T::ctx_t ctx(cgbn_no_checks);
+  typename T::Env E(ctx, &cur[C_N], np0);
+  typename T::bn_t r;
+  cgbn_mem_t<BITS> *IN = INVN + (size_t)blockIdx.x * 2 * IPB;
+  if (t == 0) {
+    cgbn_load(E.env, r, mp(&INVTOT[blockIdx.x]));
+    cgbn_store(E.env, &IN[1], r);
+  }
+  tree_down<TPI, BITS>(E, NODES + (size_t)blockIdx.x * 2 * IPB, IN, t, r);
+  if (i < count) cgbn_store(E.env, &INV[i], r);
+}
+
+/* A step in two kernels around the batch inversion: one group of TPI
+   threads per pp consecutive progressions (instance j: progressions
+   c*nprog + p in [j pp, (j+1) pp), of any curves: the modulus is the same),
+   the S pp additions of which form one chunk of the inversion (chunked
+   prefix products, then the block's product tree).
+   k_w_pre: emits the roots of the progressions (as k_w_prep) and the prefix
+   products PRE of the denominators (index (c*nprog + p)*S + i); the chunks'
+   totals go into the block's product tree (NODES), the block's total into
+   TOT[block]. */
+template <uint32_t TPI, uint32_t BITS>
+__device__ __forceinline__ void w_den(typename K<TPI, BITS>::Env &E, typename K<TPI, BITS>::bn_t &den,
+                                      const typename K<TPI, BITS>::bn_t &x1, const typename K<TPI, BITS>::bn_t &x2,
+                                      const typename K<TPI, BITS>::bn_t &y1, const typename K<TPI, BITS>::bn_t &y2,
+                                      const cgbn_mem_t<BITS> *cur, int *flag) {
+  E.sub(den, x2, x1);
+  if (E.is_zero(den)) {
+    if (cgbn_equals(E.env, y1, y2) && !E.is_zero(y1)) {
+      E.add(den, y1, y1);  // a doubling
+    } else {  // opposite points: the point at infinity (flagged; any value will do)
+      if (flag && (threadIdx.x % TPI) == 0) *flag = 1;
+      cgbn_load(E.env, den, mp(&cur[C_ONE]));
+    }
+  }
+}
+
+template <uint32_t TPI, uint32_t BITS>
+__global__ void __launch_bounds__(BLOCK, aff_min_blocks(TPI, BITS)) k_w_pre(const cgbn_mem_t<BITS> *cur, uint32_t np0, const cgbn_mem_t<BITS> *RX,
+                        const cgbn_mem_t<BITS> *RY, int S, size_t nprog, size_t ncurves, size_t pp, size_t n,
+                        const int32_t *slot, const int64_t *sbase, int64_t sinc, size_t count, size_t blen,
+                        size_t nring, cgbn_mem_t<BITS> *OX, cgbn_mem_t<BITS> *PRE, cgbn_mem_t<BITS> *NODES,
+                        cgbn_mem_t<BITS> *TOT, int *flag) {
+  typedef K<TPI, BITS> T;
+  constexpr int IPB = BLOCK / TPI;
+  const size_t j = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) / TPI, np = nprog * ncurves;
+  typename T::ctx_t ctx(cgbn_no_checks);
+  typename T::Env E(ctx, &cur[C_N], np0);
+  typename T::bn_t x1, y1, x2, y2, den, acc;
+  cgbn_load(E.env, acc, mp(&cur[C_ONE]));
+  const size_t cp1 = (j + 1) * pp < np ? (j + 1) * pp : np;
+  for (size_t cp = j * pp; cp < cp1; cp++) {
+    const size_t cv = cp / nprog, p = cp - cv * nprog, base = cp * (S + 1);
+    const cgbn_mem_t<BITS> *cc = cur + cv * C_COUNT;
+    cgbn_load(E.env, x1, mp(&RX[base]));
+    cgbn_load(E.env, y1, mp(&RY[base]));
+    int64_t sl = slot ? (int64_t)slot[n * nprog + p] : sbase[p] + (int64_t)n * sinc;
+    if (!slot && sl >= (int64_t)count) sl = -1;
+    if (sl >= 0) {
+      const size_t blk = (size_t)sl / blen, o = ((blk % nring) * ncurves + cv) * blen + ((size_t)sl - blk * blen);
+      cgbn_store(E.env, &OX[o], x1);
+    }
+    for (int i = 0; i < S; i++) {
+      cgbn_load(E.env, x2, mp(&RX[base + i + 1]));
+      cgbn_load(E.env, y2, mp(&RY[base + i + 1]));
+      w_den<TPI, BITS>(E, den, x1, x2, y1, y2, cc, flag);
+      if (cp == j * pp && i == 0) cgbn_set(E.env, acc, den);
+      else E.mul(acc, acc, den);
+      cgbn_store(E.env, &PRE[cp * S + i], acc);
+      cgbn_set(E.env, x1, x2);
+      cgbn_set(E.env, y1, y2);
+    }
+  }
+  const int t = threadIdx.x / TPI;
+  cgbn_mem_t<BITS> *N = NODES + (size_t)blockIdx.x * 2 * IPB;
+  tree_up<TPI, BITS>(E, acc, N, t);
+  if (t == 0) {
+    cgbn_load(E.env, acc, &N[1]);
+    cgbn_store(E.env, &TOT[blockIdx.x], acc);
+  }
+}
+
+/* k_w_post: from INVTOT[block] = 1/TOT[block] down the block's tree to the
+   inverse of the chunk's total, then backwards through the chunk: the
+   inverse of each denominator and the addition, entry i := entry i + entry
+   i+1: l = (y2 - y1) / (x2 - x1) (or (3 x1^2 + a) / (2 y1)), x3 = l^2 - x1 -
+   x2, y3 = l (x1 - x3) - y1; read R*, written to W* (entry S is constant and
+   in both copies) */
+template <uint32_t TPI, uint32_t BITS>
+__global__ void __launch_bounds__(BLOCK, aff_min_blocks(TPI, BITS)) k_w_post(const cgbn_mem_t<BITS> *cur, uint32_t np0, const cgbn_mem_t<BITS> *RX,
+                         const cgbn_mem_t<BITS> *RY, cgbn_mem_t<BITS> *WX, cgbn_mem_t<BITS> *WY, int S, size_t nprog,
+                         size_t ncurves, size_t pp, const cgbn_mem_t<BITS> *PRE, const cgbn_mem_t<BITS> *NODES,
+                         cgbn_mem_t<BITS> *INVN, const cgbn_mem_t<BITS> *INVTOT) {
+  typedef K<TPI, BITS> T;
+  constexpr int IPB = BLOCK / TPI;
+  const size_t j = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) / TPI, np = nprog * ncurves;
+  typename T::ctx_t ctx(cgbn_no_checks);
+  typename T::Env E(ctx, &cur[C_N], np0);
+  typename T::bn_t x1, y1, x2, y2, I, l, t;
+  {
+    const int ti = threadIdx.x / TPI;
+    cgbn_mem_t<BITS> *IN = INVN + (size_t)blockIdx.x * 2 * IPB;
+    if (ti == 0) {
+      cgbn_load(E.env, I, mp(&INVTOT[blockIdx.x]));
+      cgbn_store(E.env, &IN[1], I);
+    }
+    tree_down<TPI, BITS>(E, NODES + (size_t)blockIdx.x * 2 * IPB, IN, ti, I);
+  }
+  const size_t cp1 = (j + 1) * pp < np ? (j + 1) * pp : np;
+  for (size_t cp = cp1; cp-- > j * pp;) {
+    const size_t base = cp * (S + 1);
+    const cgbn_mem_t<BITS> *cc = cur + (cp / nprog) * C_COUNT;
+    cgbn_load(E.env, x2, mp(&RX[base + S]));
+    cgbn_load(E.env, y2, mp(&RY[base + S]));
+    for (int i = S; i-- > 0;) {
+      cgbn_load(E.env, x1, mp(&RX[base + i]));
+      cgbn_load(E.env, y1, mp(&RY[base + i]));
+      if (cp == j * pp && i == 0) {
+        cgbn_set(E.env, l, I);  // the inverse of the chunk's first denominator
+      } else {
+        cgbn_load(E.env, t, mp(&PRE[cp * S + i - 1]));
+        E.mul(l, I, t);
+        w_den<TPI, BITS>(E, t, x1, x2, y1, y2, cc, nullptr);
+        E.mul(I, I, t);
+      }
+      if (cgbn_equals(E.env, x1, x2)) {  // a doubling (k_w_pre flagged the other case)
+        E.mul(t, x1, x1);
+        E.add(x2, t, t);
+        E.add(t, x2, t);
+        cgbn_load(E.env, x2, mp(&cc[C_AW]));
+        E.add(t, t, x2);
+        cgbn_set(E.env, x2, x1);
+      } else {
+        E.sub(t, y2, y1);
+      }
+      E.mul(l, l, t);  // lambda
+      E.mul(t, l, l);
+      E.sub(t, t, x1);
+      E.sub(t, t, x2);  // x3
+      E.sub(y2, x1, t);
+      E.mul(y2, y2, l);
+      E.sub(y2, y2, y1);  // y3
+      cgbn_store(E.env, &WX[base + i], t);
+      cgbn_store(E.env, &WY[base + i], y2);
+      cgbn_set(E.env, x2, x1);
+      cgbn_set(E.env, y2, y1);
+    }
+  }
+}
+
+/* out limbs (32-bit, limb-major, ld) := the roots of this block (OX, affine
+   x in Montgomery form), canonical; blen per curve, the first len used */
+template <uint32_t TPI, uint32_t BITS>
+__global__ void k_w_out(const cgbn_mem_t<BITS> *cur, uint32_t np0, const cgbn_mem_t<BITS> *OX, size_t blen, size_t len,
+                        size_t ncurves, uint32_t *out, size_t ld, int nl) {
+  typedef K<TPI, BITS> T;
+  const size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) / TPI;
+  if (i >= blen * ncurves || i % blen >= len) return;
+  cur += (i / blen) * C_COUNT;
+  typename T::ctx_t ctx(cgbn_no_checks);
+  typename T::Env E(ctx, &cur[C_N], np0);
+  typename T::bn_t x;
+  cgbn_load(E.env, x, mp(&OX[i]));
+  E.from_mont(x, x);
+  const bool lead = (threadIdx.x % TPI) == 0;
+  for (int j = 0; j < nl; j++) {
+    uint32_t w = cgbn_extract_bits_ui32(E.env, x, 32 * j, 32);
+    if (lead) out[(size_t)j * ld + i] = w;
+  }
+}
+
 /* --------------------------------------------------------------------- host */
 
 template <uint32_t BITS>
@@ -426,7 +806,7 @@ unsigned grid_for(size_t instances, uint32_t tpi) {
 /* Host side of the Edwards model of a curve. Returns ROOTS_FACTOR (factor
    set) if 3B or u+1 is not invertible. */
 struct EdwardsModel {
-  Z n, a, d, A, c3;          // a, d: Edwards; A: Montgomery; c3 = 1/(3B)
+  Z n, a, d, A, c3, aw;      // a, d: Edwards; A: Montgomery; c3 = 1/(3B); aw: Weierstrass a
   Z X, Y, Zc, T;             // the point (u, 1)
   int init(const MontgomeryCurve &C, mpz_t factor) {
     mpz_set(n, C.n);
@@ -444,6 +824,8 @@ struct EdwardsModel {
     mpz_mul(X, C.u, Zc); mpz_mod(X, X, n);
     mpz_sub_ui(Y, C.u, 1); mpz_mod(Y, Y, n);
     mpz_mul(T, C.u, Y); mpz_mod(T, T, n);
+    mpz_mul(aw, A, A); mpz_ui_sub(aw, 3, aw);                              // aw = (3 - A^2) / (3 B^2)
+    mpz_mul(t, c3, c3); mpz_mul_ui(t, t, 3); mpz_mul(aw, aw, t); mpz_mod(aw, aw, n);
     return ROOTS_OK;
   }
 };
@@ -461,7 +843,7 @@ cgbn_mem_t<BITS> *upload_consts(const EdwardsModel *Ms, size_t count, cudaStream
     const EdwardsModel &M = Ms[c];
     cgbn_mem_t<BITS> *hc = h.data() + c * C_COUNT;
     to_mem(hc[C_N], M.n.get());
-    const Z *vals[C_COUNT] = {nullptr, &M.a, &M.d, &M.A, &M.c3, nullptr, &M.X, &M.Y, &M.Zc, &M.T};
+    const Z *vals[C_COUNT] = {nullptr, &M.a, &M.d, &M.A, &M.c3, nullptr, &M.X, &M.Y, &M.Zc, &M.T, &M.aw};
     for (int i = 1; i < C_COUNT; i++) {
       if (vals[i]) mpz_mul(t, vals[i]->get(), R);
       else mpz_set(t, R);  // one
@@ -476,7 +858,7 @@ cgbn_mem_t<BITS> *upload_consts(const EdwardsModel *Ms, size_t count, cudaStream
 }
 
 /* INV[i] = 1/V[i] (Montgomery form in and out; V[i] == 0 marks an unused
-   slot or the point at infinity and is treated as 1).
+   slot or the point at infinity and is treated as 1; INV may be V).
    Levels of chunked prefix products on the GPU until at most HOST_INV values
    remain, which are inverted on the host. The first chunk size adapts to the
    count (long chunks for throughput when there is enough parallelism, short
@@ -514,40 +896,55 @@ int batch_inverse(const cgbn_mem_t<BITS> *cur, uint32_t np0, const mpz_t n, cons
   std::vector<mem_t> ht(cnt);
   CUDA_CHECK(cudaMemcpyAsync(ht.data(), v, sizeof(mem_t) * cnt, cudaMemcpyDeviceToHost, s));
   CUDA_CHECK(cudaStreamSynchronize(s));
+  /* on the host: Montgomery's trick again, one inversion for all cnt values */
   int ret = ROOTS_OK;
   Z R2, x, xi, one;
   mpz_set_ui(R2, 1);
   mpz_mul_2exp(R2, R2, 2 * BITS);
   mpz_mod(R2, R2, n);
+  mpz_set_ui(one, 1);
+  mpz_mul_2exp(one, one, BITS);
+  mpz_mod(one, one, n);  // R
+  std::vector<Z> hx(cnt), pre(cnt);
   for (size_t i = 0; i < cnt; i++) {
-    from_mem(x, ht[i]);  // Montgomery form T*R
-    if (mpz_sgn(x.get()) == 0 && lv.empty()) {  // an original input: zero counts as one, 1 -> R
-      mpz_set_ui(one, 1);
-      mpz_mul_2exp(one, one, BITS);
-      mpz_mod(x, one, n);
-    }
-    if (!mpz_invert(xi, x, n)) {
-      /* the factor: the gcd of the first original value that is not
-         invertible (gcd(V R, n) = gcd(V, n)) */
-      std::vector<mem_t> hv(count);
-      CUDA_CHECK(cudaMemcpyAsync(hv.data(), V, sizeof(mem_t) * count, cudaMemcpyDeviceToHost, s));
-      CUDA_CHECK(cudaStreamSynchronize(s));
-      mpz_gcd(factor, x, n);  // (not reached: some nonzero V[i] is not invertible)
-      for (size_t j = 0; j < count; j++) {
-        from_mem(x, hv[j]);
-        if (mpz_sgn(x.get()) == 0) continue;
-        mpz_gcd(xi, x, n);
-        if (mpz_cmp_ui(xi, 1) != 0) {
-          mpz_set(factor, xi);
-          break;
-        }
+    from_mem(hx[i], ht[i]);  // Montgomery form T*R
+    if (mpz_sgn(hx[i].get()) == 0 && lv.empty()) mpz_set(hx[i], one);  // an original input: zero counts as one
+    if (i) {
+      mpz_mul(pre[i], pre[i - 1], hx[i]);
+      mpz_mod(pre[i], pre[i], n);
+    } else
+      mpz_set(pre[i], hx[i]);
+  }
+  if (!mpz_invert(xi, pre[cnt - 1], n)) {
+    /* the factor: the gcd of the first original value that is not
+       invertible (gcd(V R, n) = gcd(V, n)) */
+    std::vector<mem_t> hv(count);
+    CUDA_CHECK(cudaMemcpyAsync(hv.data(), V, sizeof(mem_t) * count, cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(cudaStreamSynchronize(s));
+    mpz_gcd(factor, pre[cnt - 1], n);  // (not reached: some nonzero V[i] is not invertible)
+    for (size_t j = 0; j < count; j++) {
+      from_mem(x, hv[j]);
+      if (mpz_sgn(x.get()) == 0) continue;
+      mpz_gcd(xi, x, n);
+      if (mpz_cmp_ui(xi, 1) != 0) {
+        mpz_set(factor, xi);
+        break;
       }
-      ret = ROOTS_FACTOR;
-      break;
     }
-    mpz_mul(xi, xi, R2);  // (T R)^-1 R^2 = T^-1 R
-    mpz_mod(xi, xi, n);
-    to_mem(ht[i], xi.get());
+    ret = ROOTS_FACTOR;
+  } else {
+    for (size_t i = cnt; i-- > 0;) {  // xi = 1/(x_0 ... x_i)
+      if (i) {
+        mpz_mul(x, xi, pre[i - 1]);  // 1/x_i
+        mpz_mul(xi, xi, hx[i]);
+        mpz_mod(xi, xi, n);
+      } else
+        mpz_set(x, xi);
+      mpz_mod(x, x, n);
+      mpz_mul(x, x, R2);  // (T R)^-1 R^2 = T^-1 R
+      mpz_mod(x, x, n);
+      to_mem(ht[i], x.get());
+    }
   }
   if (ret == ROOTS_OK) {
     CUDA_CHECK(cudaMemcpyAsync(inv, ht.data(), sizeof(mem_t) * cnt, cudaMemcpyHostToDevice, s));
@@ -560,8 +957,7 @@ int batch_inverse(const cgbn_mem_t<BITS> *cur, uint32_t np0, const mpz_t n, cons
       CUDA_CHECK(cudaGetLastError());
     }
   }
-  for (void *p : tmp) dfree(p, s);
-  CUDA_CHECK(cudaStreamSynchronize(s));
+  for (void *p : tmp) dfree(p, s);  // (stream-ordered: no synchronisation needed)
   return ret;
 }
 
@@ -626,11 +1022,122 @@ struct ImplT : RootGenerator::Impl {
   size_t next = 0, step = 0;
   mem_t *FX = nullptr, *FY = nullptr, *FZ = nullptr, *FT = nullptr, *GX = nullptr, *GY = nullptr, *GZ = nullptr,
         *GT = nullptr, *OS = nullptr, *OD = nullptr, *INV = nullptr;
+  /* affine Weierstrass steps (plan.affine): the tables (x, y), two copies,
+     and the denominators' prefix products */
+  bool aff = false;
+  int pending = ROOTS_OK;  // a factor met while converting the tables, reported by next_block
+  Z pending_factor;
+  mem_t *AX0 = nullptr, *AY0 = nullptr, *AX1 = nullptr, *AY1 = nullptr, *PRE = nullptr;
+  int *dflag = nullptr;
+  size_t pp = 1, ninst = 0;  // progressions per instance of k_w_pre / k_w_post, instances
+  /* the batch inversion of the instances' totals, with buffers kept for the
+     plan: levels of block product trees down to one value, inverted on the
+     host. Level 0: the instances of k_w_pre / k_w_post (their trees); level
+     l > 0: the count values V (level l-1's block totals) and their inverses
+     INV, and (but for the top, count 1) their trees */
+  static constexpr size_t IPB = BLOCK / TPI;
+  struct Level { size_t count; mem_t *V, *INV, *NODES, *INVN; };
+  std::vector<Level> lv;
+  mem_t *hpin = nullptr;  // (pinned) the value inverted on the host
+  Z R2;
 
   void free_plan() {
-    for (void *p : std::initializer_list<void *>{FX, FY, FZ, FT, GX, GY, GZ, GT, OS, OD, INV}) dfree(p, s);
-    FX = FY = FZ = FT = GX = GY = GZ = GT = OS = OD = INV = nullptr;
+    if (hpin) CUDA_CHECK(cudaStreamSynchronize(s));  // (a copy from hpin may be pending)
+    for (void *p : std::initializer_list<void *>{FX, FY, FZ, FT, GX, GY, GZ, GT, OS, OD, INV, AX0, AY0, AX1, AY1,
+                                                 PRE, (mem_t *)dflag})
+      dfree(p, s);
+    FX = FY = FZ = FT = GX = GY = GZ = GT = OS = OD = INV = AX0 = AY0 = AX1 = AY1 = PRE = nullptr;
+    dflag = nullptr;
+    for (const Level &L : lv)
+      for (void *p : {L.V, L.INV, L.NODES, L.INVN}) dfree(p, s);
+    lv.clear();
+    if (hpin) {
+      CUDA_CHECK(cudaFreeHost(hpin));
+      hpin = nullptr;
+    }
     pl = nullptr;
+  }
+
+  void make_levels(size_t count) {
+    for (size_t cnt = count, l = 0;; l++) {
+      Level L{cnt, nullptr, nullptr, nullptr, nullptr};
+      if (l) {
+        L.V = dmalloc<mem_t>(cnt, s);
+        L.INV = dmalloc<mem_t>(cnt, s);
+      }
+      if (cnt > 1 || l == 0) {
+        const size_t nb = (cnt + IPB - 1) / IPB;
+        L.NODES = dmalloc<mem_t>(nb * 2 * IPB, s);
+        L.INVN = dmalloc<mem_t>(nb * 2 * IPB, s);
+        lv.push_back(L);
+        cnt = nb;
+      } else {
+        lv.push_back(L);
+        break;
+      }
+    }
+    CUDA_CHECK(cudaMallocHost(&hpin, sizeof(mem_t)));
+    mpz_set_ui(R2, 1);
+    mpz_mul_2exp(R2, R2, 2 * BITS);
+    mpz_mod(R2, R2, n);
+  }
+
+  /* lv[1].INV := 1/lv[1].V (the block totals of level 0); ROOTS_FACTOR if
+     some value is not invertible */
+  int invert_levels() {
+    const size_t top = lv.size() - 1;
+    for (size_t l = 1; l < top; l++) {
+      const Level &L = lv[l];
+      k_tree_up<TPI, BITS><<<grid_for(L.count, TPI), BLOCK, 0, s>>>(cur, np0, L.V, L.count, L.NODES, lv[l + 1].V);
+      CUDA_CHECK(cudaGetLastError());
+    }
+    CUDA_CHECK(cudaMemcpyAsync(hpin, lv[top].V, sizeof(mem_t), cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(cudaStreamSynchronize(s));
+    Z x;
+    from_mem(x, *hpin);  // T R; its inverse T^-1 R = R^2 / (T R)
+    if (!mpz_invert(x, x, n)) return ROOTS_FACTOR;
+    mpz_mul(x, x, R2);
+    mpz_mod(x, x, n);
+    to_mem(*hpin, x.get());
+    CUDA_CHECK(cudaMemcpyAsync(lv[top].INV, hpin, sizeof(mem_t), cudaMemcpyHostToDevice, s));
+    for (size_t l = top; l-- > 1;) {
+      const Level &L = lv[l];
+      k_tree_down<TPI, BITS><<<grid_for(L.count, TPI), BLOCK, 0, s>>>(cur, np0, L.NODES, L.INVN, lv[l + 1].INV,
+                                                                      L.count, L.INV);
+      CUDA_CHECK(cudaGetLastError());
+    }
+    return ROOTS_OK;
+  }
+
+  /* the difference tables (Edwards, FX..FT) -> affine Weierstrass (AX/AY,
+     both copies), in place: AX0, AY0, AX1, AY1 = FX, FY, FZ, FT (peak memory
+     about 6 values per table entry); false if a point is not affine (then
+     the Edwards steps run, from the tables as they were), or ROOTS_FACTOR in
+     *ret if a denominator is not invertible */
+  bool to_affine(size_t all, mpz_t factor, int *ret) {
+    *ret = ROOTS_OK;
+    const size_t per = pl->nprog * (pl->S + 1);
+    mem_t *D = dmalloc<mem_t>(all, s);
+    int *flag = dmalloc<int>(1, s), hflag = 0;
+    CUDA_CHECK(cudaMemsetAsync(flag, 0, sizeof(int), s));
+    k_w_den<TPI, BITS><<<grid_for(all, TPI), BLOCK, 0, s>>>(cur, np0, per, all, FX, FY, FZ, D, flag);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpyAsync(&hflag, flag, sizeof(int), cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(cudaStreamSynchronize(s));
+    const bool ok = hflag == 0;
+    if (ok) {
+      *ret = batch_inverse<TPI, BITS>(cur, np0, n, D, all, D, factor, s);  // (in place)
+      if (*ret == ROOTS_OK) {
+        k_w_conv<TPI, BITS><<<grid_for(all, TPI), BLOCK, 0, s>>>(cur, np0, per, all, FX, FY, FZ, D, FX, FY, FZ,
+                                                                 FT);
+        CUDA_CHECK(cudaGetLastError());
+        AX0 = FX; AY0 = FY; AX1 = FZ; AY1 = FT;
+        FX = FY = FZ = FT = nullptr;
+      }
+    }
+    dfree(D, s);
+    dfree(flag, s);
+    return ok && *ret == ROOTS_OK;
   }
 
   int start(const RootPlanGPU &plan) override {
@@ -659,6 +1166,27 @@ struct ImplT : RootGenerator::Impl {
           CUDA_CHECK(cudaGetLastError());
         }
     }
+    aff = false;
+    pending = ROOTS_OK;
+    if (plan.affine) {
+      int ret;
+      aff = to_affine(all, pending_factor.get(), &ret);
+      if (ret != ROOTS_OK) {  // reported by the first next_block
+        pending = ret;
+        aff = true;
+        return ROOTS_OK;
+      }
+      if (aff) {
+        pp = std::max(1, 8 / plan.S);
+        ninst = (plan.nprog * nc + pp - 1) / pp;
+        PRE = dmalloc<mem_t>(plan.nprog * plan.S * nc, s);
+        make_levels(ninst);
+        dflag = dmalloc<int>(1, s);
+        CUDA_CHECK(cudaMemsetAsync(dflag, 0, sizeof(int), s));
+        OS = dmalloc<mem_t>(plan.nring * plan.blen * nc, s);
+        return ROOTS_OK;
+      }
+    }
     /* the steps alternate between two copies of the tables */
     GX = dmalloc<mem_t>(all, s); GY = dmalloc<mem_t>(all, s); GZ = dmalloc<mem_t>(all, s); GT = dmalloc<mem_t>(all, s);
     for (auto pr : {std::make_pair(FX, GX), std::make_pair(FY, GY), std::make_pair(FZ, GZ), std::make_pair(FT, GT)})
@@ -671,6 +1199,7 @@ struct ImplT : RootGenerator::Impl {
 
   int next_block(const RnsContext &ctx, uint32_t *out, mpz_t factor) override {
     if (!pl || next >= pl->nblocks) return ROOTS_ERROR;
+    if (aff) return next_block_affine(ctx, out, factor);
     const RootPlanGPU &P = *pl;
     const size_t b = next++;
     const unsigned nblk = grid_for(P.nprog * P.S * nc, TPI);
@@ -692,6 +1221,62 @@ struct ImplT : RootGenerator::Impl {
     if (ret == ROOTS_OK) {
       k_extract<TPI, BITS><<<grid_for(P.blen * nc, TPI), BLOCK, 0, s>>>(cur, np0, OS + off, OD + off, INV, P.blen,
                                                                        len, nc, out, P.blen * nc, ctx.nlimbs());
+      CUDA_CHECK(cudaGetLastError());
+    }
+    if (next == P.nblocks || ret != ROOTS_OK) free_plan();
+    return ret;
+  }
+
+  int next_block_affine(const RnsContext &ctx, uint32_t *out, mpz_t factor) {
+    if (pending != ROOTS_OK) {
+      const int r = pending;
+      mpz_set(factor, pending_factor.get());
+      free_plan();
+      return r;
+    }
+    const RootPlanGPU &P = *pl;
+    const size_t b = next++;
+    const unsigned nblk = grid_for(ninst, TPI);
+    int ret = ROOTS_OK;
+    for (; step <= P.last_step[b] && step < P.steps; step++) {
+      mem_t *RX = step & 1 ? AX1 : AX0, *RY = step & 1 ? AY1 : AY0, *WX = step & 1 ? AX0 : AX1,
+            *WY = step & 1 ? AY0 : AY1;
+      k_w_pre<TPI, BITS><<<nblk, BLOCK, 0, s>>>(cur, np0, RX, RY, P.S, P.nprog, nc, pp, step, P.slot, P.base, P.inc,
+                                                P.count, P.blen, P.nring, OS, PRE, lv[0].NODES, lv[1].V, dflag);
+      CUDA_CHECK(cudaGetLastError());
+      ret = invert_levels();
+      if (ret != ROOTS_OK) {
+        /* the factor of the first denominator of this step that is not
+           invertible (the factor that batch_inverse finds) */
+        const size_t nadd = P.nprog * P.S * nc;
+        mem_t *DEN = dmalloc<mem_t>(nadd, s), *DINV = dmalloc<mem_t>(nadd, s);
+        k_w_prep<TPI, BITS><<<grid_for(nadd, TPI), BLOCK, 0, s>>>(cur, np0, RX, RY, P.S, P.nprog, nc, step, P.slot,
+                                                                  P.base, P.inc, P.count, P.blen, P.nring, OS, DEN,
+                                                                  dflag);
+        CUDA_CHECK(cudaGetLastError());
+        ret = batch_inverse<TPI, BITS>(cur, np0, n, DEN, nadd, DINV, factor, s);
+        if (ret == ROOTS_OK) ret = ROOTS_ERROR;  // (not reached)
+        dfree(DEN, s);
+        dfree(DINV, s);
+        break;
+      }
+      k_w_post<TPI, BITS><<<nblk, BLOCK, 0, s>>>(cur, np0, RX, RY, WX, WY, P.S, P.nprog, nc, pp, PRE, lv[0].NODES,
+                                                 lv[0].INVN, lv[1].INV);
+      CUDA_CHECK(cudaGetLastError());
+    }
+    int hflag = 0;
+    if (ret == ROOTS_OK) {
+      CUDA_CHECK(cudaMemcpyAsync(&hflag, dflag, sizeof(int), cudaMemcpyDeviceToHost, s));
+      CUDA_CHECK(cudaStreamSynchronize(s));
+    }
+    if (ret == ROOTS_OK && hflag) {
+      fprintf(stderr, "RootGenerator: a progression met the point at infinity (affine steps)\n");
+      ret = ROOTS_ERROR;
+    }
+    if (ret == ROOTS_OK) {
+      const size_t len = std::min(P.blen, P.count - b * P.blen), off = (b % P.nring) * P.blen * nc;
+      k_w_out<TPI, BITS><<<grid_for(P.blen * nc, TPI), BLOCK, 0, s>>>(cur, np0, OS + off, P.blen, len, nc, out,
+                                                                     P.blen * nc, ctx.nlimbs());
       CUDA_CHECK(cudaGetLastError());
     }
     if (next == P.nblocks || ret != ROOTS_OK) free_plan();

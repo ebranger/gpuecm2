@@ -403,3 +403,79 @@ idea gains less in gpuecm2 (docs/DESIGN.md). Its root generation is about 10% fa
 gpuecm2's at 1000 bits, B1 = 1e6; at 16000–32000 bits it uses products by transforms for the
 roots (docs/DESIGN.md, Ideas evaluated), which these small-B1 runs (x^1, dF = 256) hardly
 exercise.
+
+## Affine root steps (M12, October 2026)
+
+The root generation's progression steps in affine Weierstrass coordinates with one batched
+inversion per step (docs/DESIGN.md, Arithmetic), against the Edwards steps; `bench_stage2
+N B1 -batch 0` (automatic batch, GMP-ECM's parameters), stage 2 time per curve, best of 2
+processes of 2 repetitions, both with the root stream's priority and the launch bounds below;
+"affine": the roots of F and G, "G": only those of G (4 times the Edwards plans'
+progressions in both); S = −12 at 4000 and 8000 bits with `-dickson 12`. 12000 and 16000 bits ran with the 16384-bit kernels, 24000 and 32000
+bits with the 32768-bit ones (builds of one size), so 12000 and 24000 bits are slower than
+with the full ladder.
+
+| N bits | B1 | S | Edwards | affine | G | affine / Edwards |
+|---|---|---|---|---|---|---|
+| 500 | 1e5 | 2 | 0.30 ms | 0.33 ms | 0.32 ms | 1.10 |
+| 500 | 1e6 | −6 | 2.01 ms | 2.23 ms | 2.11 ms | 1.11 |
+| 500 | 1e7 | −12 | 15.3 ms | 21.5 ms | 18.9 ms | 1.41 |
+| 1000 | 1e5 | 2 | 0.65 ms | 0.68 ms | 0.65 ms | 1.05 |
+| 1000 | 1e6 | −6 | 4.93 ms | 4.98 ms | 4.85 ms | 1.01 |
+| 1000 | 1e7 | −12 | 36.4 ms | 46.0 ms | 40.3 ms | 1.26 |
+| 2000 | 1e5 | 2 | 1.65 ms | 1.70 ms | 1.64 ms | 1.03 |
+| 2000 | 1e6 | −3 | 9.92 ms | 9.93 ms | 9.79 ms | 1.00 |
+| 2000 | 1e7 | −12 | 94.6 ms | 107 ms | 101 ms | 1.13 |
+| 2500 | 1e6 | −3 | 14.3 ms | 14.0 ms | 14.1 ms | 0.98 |
+| 3000 | 1e5 | 2 | 3.03 ms | 3.05 ms | | 1.01 |
+| 3000 | 1e6 | −3 | 18.2 ms | 18.9 ms | | 1.04 |
+| 3500 | 1e5 | 2 | 3.32 ms | 3.32 ms | 3.27 ms | 1.00 |
+| 3500 | 1e6 | −3 | 20.7 ms | 19.8 ms | 20.2 ms | 0.96 |
+| 4000 | 1e5 | 2 | 4.06 ms | 3.87 ms | | 0.95 |
+| 4000 | 1e6 | −3 | 24.8 ms | 24.0 ms | | 0.97 |
+| 4000 | 1e6 | −12 | 43.6 ms | 49.2 ms | 44.4 ms | 1.13 |
+| 4000 | 1e7 | −12 | 250 ms | 273 ms | 261 ms | 1.09 |
+| 5000 | 1e5 | 2 | 5.76 ms | 5.58 ms | | 0.97 |
+| 5000 | 1e6 | −3 | 35.3 ms | 34.4 ms | | 0.98 |
+| 6000 | 1e5 | 2 | 8.05 ms | 7.77 ms | | 0.97 |
+| 6000 | 1e6 | −3 | 49.1 ms | 47.7 ms | | 0.97 |
+| 6000 | 3e6 | −6 | 142 ms | 138 ms | 141 ms | 0.97 |
+| 8000 | 1e5 | 2 | 12.7 ms | 12.1 ms | | 0.95 |
+| 8000 | 1e6 | −3 | 77.3 ms | 74.5 ms | | 0.96 |
+| 8000 | 3e6 | −6 | 229 ms | 222 ms | | 0.97 |
+| 8000 | 1e6 | −12 | 142 ms | 165 ms | 147 ms | 1.16 |
+| 12000 | 1e5 | 2 | 32.7 ms | 29.7 ms | 30.6 ms | 0.91 |
+| 12000 | 1e6 | −3 | 199 ms | 179 ms | 186 ms | 0.90 |
+| 16000 | 1e5 | 2 | 42.4 ms | 38.7 ms | 40.2 ms | 0.91 |
+| 16000 | 1e6 | −3 | 247 ms | 239 ms | 235 ms | 0.97 |
+| 24000 | 1e5 | 2 | 119 ms | 102 ms | | 0.86 |
+| 32000 | 1e5 | 2 | 161 ms | 145 ms | 148 ms | 0.90 |
+| 32000 | 1e6 | −3 | 916 ms | 929 ms | 904 ms | 1.01 |
+
+So the affine steps are used from 3073 bits on (the CGBN sizes from 3584 bits) for degrees
+|S| <= 6, and the Edwards steps otherwise (at 2048–2560 bits they gain 0–2% at B1 = 1e6 and
+lose up to 3% at 1e5; with TPI 8, at 1024 and 3072 bits, they are slower). For the roots of
+F, which nothing overlaps, the affine steps are slower at 32000 bits and B1 = 1e6, where
+those of G alone gain 1%; elsewhere both together are the better choice. Per addition the affine kernels take about a
+third of the Edwards step's kernel time (3 ns against 9.6 ns at 1024 bits), but a step waits
+for its batch inversion: at 1024 bits about 435 µs per step of which 113 µs were additions
+in the first version (a chain of chunked prefix products and about 130 µs on the host),
+at 8192 bits 4.3 ms of which 2 ms additions (one 8192-bit product by one group of threads
+takes about 20 µs; the host's Montgomery trick over 32 values about 1 ms). Block product
+trees (depth log2 of the block's instances instead of chunks), one value inverted on the
+host and fused kernels brought that to about 2.9 ms (8192 bits), with the polynomial work
+of the other stream filling the waits. Under WSL2 a round trip to the host costs about
+40 µs (synchronisation and relaunch); a host callback (`cudaLaunchHostFunc`) took 1.2 ms
+and a stream wait on a value written by the host 100 µs, so the host still waits for each
+step. The 4 times as many progressions cost 4 times the scalar multiplications for their
+tables, which is what makes larger S (Dickson 12 and up) slower.
+
+Two changes from this work help the Edwards steps as well. The root generation's stream has
+a higher priority than the polynomial stream (its kernels are short and the block's roots
+are on the critical path): stage 2 1–3.6% faster at 500–2000 bits, 0.6–1.1% at 4000–8000
+(`GPUECM2_ROOT_PRIO=0` for the old behaviour). And with 8–16 limbs per thread `k_step` (and
+the affine kernels) are compiled for two blocks per SM: stage 2 4.4% faster at 3000 bits
+(B1 = 1e6), 0.5–2% at 4000–8000 bits, the same at 16000; at 32768 bits (32 limbs per
+thread) the spills made it 36% slower, so it is not used there. (A first batch that grows
+the stream-ordered memory pool runs the two streams one after the other under WSL2; from the
+second batch on they overlap.)

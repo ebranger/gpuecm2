@@ -207,7 +207,8 @@ static void test_roots_vs_ecm(const char *ecm, const char *nstr, int param, unsi
   bool ok = fv.size() == sp.dF && gv.size() == sp.k * sp.dF;
   if (!ok) printf("  GMP-ECM printed %zu f and %zu g roots (expected %lu, %lu)%s\n", fv.size(), gv.size(), sp.dF, sp.k * sp.dF,
                   trace.find("actor found") != std::string::npos ? " -- it found a factor" : "");
-  for (int which = 0; which < 2 && ok; which++) {
+  for (int run = 0; run < 3 && ok; run++) {  // F all at once; G block by block, Edwards and affine steps
+    const int which = run > 0;
     ProgressionPlan pl = which == 0 ? plan_roots_F(sp, 64) : plan_roots_G(sp, 64);
     const int nl = ctx.nlimbs();
     std::vector<uint32_t> h((size_t)nl * pl.count), tmpl(nl);
@@ -222,6 +223,7 @@ static void test_roots_vs_ecm(const char *ecm, const char *nstr, int param, unsi
       RootGenerator gen;
       r = gen.init(C, plan_scalar_bits(pl), fac);
       RootPlanGPU gp(pl, sp.dF);
+      gp.affine = run == 2;
       if (r == ROOTS_OK) r = gen.start(gp);
       uint32_t *d;
       CUDA_CHECK(cudaMalloc(&d, (size_t)nl * sp.dF * 4));
@@ -242,7 +244,7 @@ static void test_roots_vs_ecm(const char *ecm, const char *nstr, int param, unsi
       mpz_import(v, ctx.nlimbs(), -1, 4, 0, 0, tmpl.data());
       mpz_set_str(w, ref[i].c_str(), 10);
       if (mpz_cmp(v, w) != 0) {
-        printf("  %s root %zu differs\n", which ? "G" : "F", i);
+        printf("  %s root %zu differs\n", run == 2 ? "G (affine steps)" : which ? "G" : "F", i);
         ok = false;
         /* which one is right?  key of root i, then f(key * d) * P on the host */
         long long key = 0;

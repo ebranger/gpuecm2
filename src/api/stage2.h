@@ -57,6 +57,16 @@ void stage2_cpu_wait(bool spin);
    for programs using the C interface). Taken by an engine when it is made,
    and by the memory estimates. */
 constexpr size_t STAGE2_RNS_AUTO_BITS = 3072;
+/* The root generation steps the progressions in affine Weierstrass
+   coordinates with one batch inversion per step (gpu/roots.h:
+   RootPlanGPU::affine) for moduli of STAGE2_AFFINE_MIN_BITS bits and more
+   (the CGBN sizes from 3584 bits on) and Brent-Suyama degrees |S| <=
+   STAGE2_AFFINE_MAX_S, where that made stage 2 up to 14% faster; otherwise
+   in Edwards coordinates. The results are identical. The environment variable
+   GPUECM2_AFFINE (0: never, 1: the roots of G, 2: of F, 3: both) overrides
+   the choice (testing aid). */
+constexpr size_t STAGE2_AFFINE_MIN_BITS = 3073;
+constexpr int STAGE2_AFFINE_MAX_S = 6;
 void stage2_set_rns_store(bool on);
 void stage2_set_rns_store_auto();
 /* whether RNS storage is used for moduli of `bits` bits */

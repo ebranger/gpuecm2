@@ -46,6 +46,7 @@ class RootPlanGPU {
   int32_t *slot = nullptr;                  // steps*nprog output slots (table form), or
   int64_t *base = nullptr;                  // nprog first output indices (affine form)
   int64_t inc = 0;                          // ... and the index increment per step
+  bool affine = false;                      // steps in affine coordinates (one batch inversion per step)
 };
 
 /* Root generation for one curve or a batch of curves with the same n.

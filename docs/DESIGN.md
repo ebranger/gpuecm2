@@ -183,6 +183,10 @@ The C interface is shaped so that GMP-ECM can call it from its per-curve stage 2
     from memory where they are used (`padd_mem`): two points and the curve constants no
     longer fit in registers (255 registers and 0.4-1.9 KB of spills per thread from 8192
     bits up, none with `padd_mem` up to 16384 bits); 1-3% faster in the whole stage 2.
+    With 8–16 limbs per thread (3072, 4096–8192 and 10240–16384 bits) `k_step` and the
+    affine step kernels are compiled for two blocks per SM (128 registers): 0.5–4% faster
+    stage 2 at 3072–8192 bits, the same at 16384; at 32768 bits the spills would make it
+    36% slower.
   - The curve is GMP-ECM's Montgomery curve, used in its twisted Edwards form
     (a = (A+2)/B, d = (A−2)/B) in extended coordinates: dedicated addition (9M + 1 product
     by a) with the unified formula as fallback, 1.4–2.4× cheaper than projective
@@ -202,8 +206,26 @@ The C interface is shaped so that GMP-ECM can call it from its per-curve stage 2
     from it are machine integers; B2 up to 1e39 is tested).
   - Projective outputs, one batched inversion per block of dF roots. G roots are produced
     block by block (the progression state is kept), so memory is O(dF) whatever k is.
-  - Root generation for block b+1 runs on its own stream while block b's polynomial work
-    runs.
+  - **Affine steps** (from 3073 bits on, for Brent-Suyama degrees |S| <= 6;
+    `RootPlanGPU::affine`): after the scalar multiplications the tables are converted once
+    to GMP-ECM's affine Weierstrass points (in place), and each step adds affine points
+    with one batched inversion of all its denominators x2 − x1 (2 y1 for a doubling):
+    `k_w_pre` emits the step's roots (affine x: no inversion or conversion per block) and
+    the prefix products of each progression's S denominators, and multiplies the
+    progressions' totals up a product tree per thread block; `k_tree_up` continues the
+    trees to one value, which the host inverts; `k_tree_down` and `k_w_post` go back down
+    and do the additions (an addition: 3 products for the inversion, 2 and a square for
+    the point, against about 10 in Edwards coordinates). The step then waits for a chain
+    of dependent products (the tree levels, the S additions of a progression) and a round
+    trip to the host, so the affine plans take 4 times as many progressions as the Edwards
+    plans (at most 10 waves, within the memory estimate), and the latency is filled by the
+    polynomial work of the other stream. A non-invertible denominator gives the factor
+    of the first such value (found by recomputing the step's denominators), as in
+    GMP-ECM's affine root setup. Measured up to 14% faster stage 2 from 3500 bits, the same
+    or slower below and for larger S (docs/BENCHMARKS.md).
+  - Root generation for block b+1 runs on its own stream, which has a higher priority than
+    the polynomial stream (its kernels are short and latency-bound: 1–3.6% faster stage 2),
+    while block b's polynomial work runs.
 - **Batch dimension everywhere** (curves × polynomials × primes), so small-dF runs (small B1)
   are not dominated by launch overhead.
 
@@ -344,7 +366,7 @@ storage, above); the others are not.
 | M9 | Large moduli, step 1: up to 32768 bits (CGBN's limit) in the current design, gpuecm2 and GMP-ECM's GPU stage 1 (more kernel sizes only). **Done:** CGBN sizes per translation unit (`GPUECM2_MAX_BITS`), a memory estimate from the allocations, kernels split for the watchdog, a two-pass RNS-to-limbs conversion and memory operands in `k_step` for large sizes; tests up to 32768 bits against GMP-ECM (boundary tests, `tests/large_tests.py`, 51 stage 2 hits of repunit cofactors). Stage 2 is 80-190 times one CPU core from B1 = 1e5 (docs/BENCHMARKS.md). |
 | M10 | All-RNS polynomial arithmetic: Montgomery reduction in the RNS by base extensions instead of conversions to and from limbs. **Done** as RNS storage (identical results), the default from 3072 bits on (`STAGE2_RNS_AUTO_BITS`), where stage 2 gets 8–25% faster with the same or up to 10% less GPU memory; below, where it gains or loses a few percent for up to 5% more memory, limbs stay the default (`-rns` / `-no-rns`, `GPUECM2_RNS=1` / `0` force either); and the two-pass RNS-to-limbs conversion from 3072 bits on. |
 | M11 | Ideas from Greg Childers' GMP-ECM GPU fork (October 2026): the low levels of the trees and of the evaluation mod n (**done**, 1–12% depending on size and storage); root arithmetic by transforms for large N and the curve arithmetic in RNS evaluated (see Ideas evaluated). Comparison of the two in docs/BENCHMARKS.md. |
-| M12 | (Planned.) Root generation with affine Weierstrass additions and one batched inversion per progression step, GMP-ECM's own method: a step is about 10^5 independent additions (all curves, progressions and table entries), so Montgomery's trick over all of them needs one modular inverse per step, about 3 products per addition, and an affine addition 2 products and a square: about 6 products instead of about 10 (Edwards, extended coordinates), and the roots come out as x directly (no batched inversion and conversion per block). Estimated 1.7–2.5 times fewer products for the roots (x^1: 15 → 6 per root, Dickson(6): 65 → 36, Dickson(30): 305 → 180), stage 2 about 1.15–1.35 times faster; half the memory for the difference tables; and the factors GMP-ECM finds while setting up the roots ("Found factor while computing fd[]") would be found the same way. Costs about three kernel phases per step instead of one. |
+| M12 | Root generation with affine Weierstrass additions and one batched inversion per progression step, GMP-ECM's own method. **Done** as affine steps (identical results; see Arithmetic) from 3073 bits on for Brent-Suyama polynomials of degree at most 6: stage 2 2–5% faster at 3500–8000 bits, 3–11% at 12000–16000 and 10–14% at 24000–32000 bits for B1 = 1e5 (1% slower at 32000 bits for B1 = 1e6); the same or slower below 4000 bits and for larger S (B1 = 1e7 at 500–2000 bits: 6–40% slower), where the Edwards steps stay. The estimate (1.15–1.35 times) counted products only: per addition the affine kernels take about a third of the Edwards step's kernel time, but a step waits for its batch inversion (chains of dependent products, ~1 µs each at 1024 bits and ~20 µs at 8192, and a round trip to the host: ~40 µs per synchronisation under WSL2; host callbacks took 1.2 ms and stream wait-value operations 100 µs), it needs 4 times as many progressions (and their scalar multiplications), and it gains only where the other stream's polynomial work fills the waits. Side results: a higher priority for the root stream (1–3.6%, all sizes) and two blocks per SM for `k_step` at 8–16 limbs per thread (0.5–4%). docs/BENCHMARKS.md. |
 
 ### M6 benchmarks (idle RTX 4070 Ti SUPER)
 

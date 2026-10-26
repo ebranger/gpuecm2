@@ -7,7 +7,7 @@ implementation changes behaviour (boundary tests).
 
 | Test | Needs | Time | What it checks |
 |---|---|---|---|
-| `ctest` (unit tests) | GPU | 1 min | arithmetic, NTT, conversions, polynomial algorithms, curve formulas, root plans, stage 2 engine with self-check and fault injection, C interface |
+| `ctest` (unit tests) | GPU | 2–3 min | arithmetic, NTT, conversions, polynomial algorithms, curve formulas, root plans (Edwards and affine steps), stage 2 engine with self-check and fault injection, C interface, the known hits |
 | `tests/run_hits.py` | GPU | 1-2 min | known stage 2 factors (`tests/data/stage2_hits.txt`) are found again, via the program and via the C interface (`capi_resume`) |
 | `tests/run_hits.py ... tests/data/stage2_hits_large.txt` | GPU | 1 min | the same for known stage 2 factors of 4609- to 32768-bit numbers (those above the largest size of the build are skipped: all need `-DGPUECM2_MAX_BITS=32768`) |
 | `tests/large_tests.py` | GPU; GMP-ECM once | `prepare` about 15 CPU core-hours (once), `check` 2 min | same results as GMP-ECM on cached residues of 4609- to 32768-bit numbers, B1 = 1e4 to 11e6 (cases above the largest size of the build are skipped) |
@@ -104,10 +104,10 @@ its code path or a discrete parameter, so that off-by-one errors and edge effect
 - Modulus sizes: each size of the CGBN ladder (512, 768, ..., 2048, 2560, ..., 4608, 5120, ...,
   8192, 10240, ..., 16384, 20480, ..., 32768 bits) and one bit more; GMP-ECM's NTT threshold
   (1920/1921 bits, where dF stops being a power of two); the switches of the RNS-to-limbs
-  conversion tile (2254/2258 and 4576/4577 bits); the switch to RNS storage (3071/3072 bits,
-  also at dF = 16384) and those of the number of low levels mod n (6144/6145, 12288/12289
-  bits); sizes where the RNS primes leave no spare bit
-  over the CRT bound (e.g. 1017, 1916, 4008, 4504 bits), with N close to 2^bits; tiny moduli
+  conversion tile (2254/2258 and 4576/4577 bits); the switches to RNS storage (3071/3072
+  bits, also at dF = 16384) and to the affine root steps (3072/3073 bits), and those of the
+  number of low levels mod n (6144/6145, 12288/12289 bits); sizes where the RNS primes leave
+  no spare bit over the CRT bound (e.g. 1017, 1916, 4008, 4504 bits), with N close to 2^bits; tiny moduli
   (64 bits); 4608 bits at small and larger dF; the largest size of the build (8192 bits by
   default, 32768 at most; `gpuecm2 -h` shows it, and the sizes above it are left out), and one
   bit more must be refused. Above 4608 bits the numbers are products of primes of about 1024
@@ -119,7 +119,8 @@ its code path or a discrete parameter, so that off-by-one errors and edge effect
   switches, where the number of NTT primes runs out for the longest NTT (dF = 2^21 at 483/484
   bits, 2^20 at 1186/1187 bits, dF = 362880 at 2520/2521 bits; GMP-ECM needs about 6 GB and
   5 minutes for each).
-- Stage 2 parameters: x^1, x^2, x^3, x^6, x^7, Dickson(3, 5, 6, 12, 30, 60); k = 1, 2, 7, 50;
+- Stage 2 parameters: x^1, x^2, x^3, x^6, x^7, Dickson(3, 5, 6, 12, 30, 60), and at 4096 bits
+  x^6, x^7, Dickson(6) and Dickson(12) (affine and Edwards root steps); k = 1, 2, 7, 50;
   tiny B2 (dF = 2..64, d2 = 1); B2 = B1 and B2 < B1 (no stage 2); B2min-B2 ranges, a single
   point, and ranges at 2^64 and 10^39 (i0 of 113 bits); `-no-ntt` below and `-ntt` above the
   NTT threshold; parametrizations 0-3.
@@ -189,6 +190,21 @@ the low levels, and `test_stage2` requires the same products from engines with n
 6 such levels (with the self-check for 4), in both storages. The suites (hits, large
 tests, boundary tests) run with the default number of levels.
 
+## Affine root steps
+
+The affine root steps (by default from 3073 bits on, for Brent-Suyama degrees |S| <= 6;
+`GPUECM2_AFFINE` forces them on or off) compute the same roots as the Edwards steps, by
+another route. `test_roots` compares the roots of G from the affine steps with GMP-ECM's
+(its trace output) besides those from the Edwards steps, and `ctest` runs `test_stage2` and
+the known hits once more with `GPUECM2_AFFINE=3` (affine steps at every size). The known
+hits (also with `-selfcheck` and through `capi_resume`) and the boundary tests (which cover
+3072/3073 bits and, at 4096 bits, x^6, x^7, Dickson(6) and Dickson(12)) pass with the
+default, with `GPUECM2_AFFINE=3` and, for the hits, with `GPUECM2_AFFINE=0`; the large hits
+and `large_tests.py check` (where the default uses the affine steps) with the default. Where
+an affine step meets a denominator that is not invertible, gpuecm2 reports the gcd of the
+first such value, as GMP-ECM does when it meets one while setting up its roots ("Found
+factor while computing fd[]"); the Edwards steps never meet one (see below).
+
 ## Testing aids
 
 Environment variables read by the stage 2 engine (for tests only):
@@ -210,3 +226,9 @@ Environment variables read by the stage 2 engine (for tests only):
   `-no-rns`; also for the C interface). Unset: RNS storage from 3072 bits on.
 - `GPUECM2_ZN_LEVELS=z`: do the lowest z levels of the product trees and of the evaluation
   mod n (0: none; the default depends on the size and the storage, docs/DESIGN.md).
+- `GPUECM2_AFFINE=0|1|2|3`: the root generation's steps in affine coordinates never, for
+  the roots of G, of F, or both (unset: both from 3073 bits on for degrees |S| <= 6, else
+  never). `GPUECM2_NPROG_MUL=x`: the affine plans' progressions, x times the Edwards
+  plans' (default 4; at most 10 waves).
+- `GPUECM2_ROOT_PRIO=0`: the root generation's stream without its higher priority
+  (benchmarks).

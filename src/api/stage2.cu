@@ -174,7 +174,8 @@ size_t stage2_gpu_bytes(const mpz_t n, const Stage2Params &sp, size_t batch) {
                                (std::fabs(mpz_get_d(sp.i0.get())) + (double)sp.k * dF * sp.d2 / eulerphi(sp.d2)) * sp.d1);
   const size_t sbits = (size_t)(S * (std::log2(std::max(vmax, 2.0)) + 2)) + 8;
   per += mem * (7 * dF + 3 * 63 * ((sbits + 5) / 6) + 8 * (S + 1) * (sp.d2 + 1));
-  /* and the progressions that fill the GPU (nprog_target: up to 8 waves of additions) */
+  /* and the progressions that fill the GPU (nprog_target: up to 8 waves of
+     additions; the affine steps' more progressions are kept within this) */
   int ndev = 0;
   const size_t cap = cudaGetDeviceCount(&ndev) == cudaSuccess && ndev > 0 ? root_step_capacity(bits) : 16384;
   const size_t waves = 8 * mem * 8 * cap * (S + 1) / std::max<unsigned long>(S, 1);
@@ -268,7 +269,12 @@ Stage2Engine::Stage2Engine(const mpz_t n, const Stage2Params &sp) : sp_(sp) {
   if (const char *e = getenv("GPUECM2_ZN_LEVELS")) zl = atoi(e);
   if (zl > 0) zn_levels_init(&zn_, n, zl);
   CUDA_CHECK(cudaStreamCreateWithFlags(&s_poly_, cudaStreamNonBlocking));
-  CUDA_CHECK(cudaStreamCreateWithFlags(&s_roots_, cudaStreamNonBlocking));
+  {  /* the root stream with priority (testing: GPUECM2_ROOT_PRIO=0 for none) */
+    int lo = 0, hi = 0;
+    CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&lo, &hi));
+    const char *e = getenv("GPUECM2_ROOT_PRIO");
+    CUDA_CHECK(cudaStreamCreateWithPriority(&s_roots_, cudaStreamNonBlocking, e && atoi(e) == 0 ? lo : hi));
+  }
   for (auto &e : ev_) CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
   ok_ = true;
 }
@@ -277,13 +283,31 @@ const Stage2Engine::Plans &Stage2Engine::plans_for(size_t batch) {
   std::unique_ptr<Plans> &p = plans_[batch];
   if (!p) {
     p.reset(new Plans);
-    p->F = plan_roots_F(sp_, nprog_target(sp_.S, sp_.dF, jmax_ * sp_.d2, cap_, batch));
-    p->G = plan_roots_G(sp_, nprog_target(sp_.S, sp_.k * sp_.dF, imax_ * sp_.d1, cap_, batch));
+    /* affine steps (stage2.h): a step waits for its batch inversion, so they
+       want more progressions (and fewer steps) than the Edwards steps: 4
+       times as many (GPUECM2_NPROG_MUL, testing aid), but at most 10 waves of
+       additions, so that their tables (about 6 values per entry while they
+       are converted) stay within the memory estimate's (stage2_gpu_bytes: 8
+       waves, 8 values per entry) */
+    const char *ea = getenv("GPUECM2_AFFINE"), *em = getenv("GPUECM2_NPROG_MUL");
+    const size_t bits = mpz_sizeinbase(n_.get(), 2);
+    const int aff = ea && *ea ? atoi(ea)
+                              : bits >= STAGE2_AFFINE_MIN_BITS && std::abs(sp_.S) <= STAGE2_AFFINE_MAX_S ? 3 : 0;
+    const double mul = em ? atof(em) : 4;
+    const size_t np_max = 10 * cap_ / ((size_t)std::max(1, std::abs(sp_.S)) * batch);
+    auto np = [&](bool affine, size_t t) {
+      return affine ? std::max(t, std::min(np_max, std::max<size_t>(1, (size_t)(t * mul)))) : t;
+    };
+    p->F = plan_roots_F(sp_, np(aff & 2, nprog_target(sp_.S, sp_.dF, jmax_ * sp_.d2, cap_, batch)));
+    p->G = plan_roots_G(sp_, np(aff & 1, nprog_target(sp_.S, sp_.k * sp_.dF, imax_ * sp_.d1, cap_, batch)));
     if (getenv("GPUECM2_DEBUG"))
-      fprintf(stderr, "roots (batch %zu): wave %zu additions; F %zu progressions x %zu steps, G %zu x %zu\n", batch,
-              cap_, p->F.nprog, p->F.steps, p->G.nprog, p->G.steps);
+      fprintf(stderr, "roots (batch %zu): wave %zu additions; F %zu progressions x %zu steps%s, G %zu x %zu%s\n",
+              batch, cap_, p->F.nprog, p->F.steps, aff & 2 ? " (affine)" : "", p->G.nprog, p->G.steps,
+              aff & 1 ? " (affine)" : "");
     p->gF.reset(new RootPlanGPU(p->F, sp_.dF));
     p->gG.reset(new RootPlanGPU(p->G, sp_.dF));
+    p->gF->affine = aff & 2;
+    p->gG->affine = aff & 1;
     p->scalar_bits = std::max(p->gF->scalar_bits, p->gG->scalar_bits);
   }
   return *p;

@@ -7,7 +7,8 @@ Thresholds covered (see docs/TESTING.md):
   - modulus sizes: the CGBN size ladder (512, 768, ..., 2048, 2560, ..., 4608,
     5120, ..., 8192, 10240, ..., 16384, 20480, ..., 32768 bits) and one bit
     more, 32-bit limb counts, GMP-ECM's NTT threshold
-    (1920 bits: power-of-two dF or not), the kernels of the RNS->limbs
+    (1920 bits: power-of-two dF or not), the affine root steps (from 3073
+    bits, for Brent-Suyama degrees up to 6), the kernels of the RNS->limbs
     conversion (tiled from 993 to 3552 bits, otherwise one dot product per
     thread with CB 32/16/8, switching at 2254-2258 and 4577 bits), sizes where the RNS
     primes leave no spare bit over the CRT bound, tiny moduli and 32768 bits
@@ -218,6 +219,11 @@ def cases(heavy, maxbits=32768):
                 ["-dickson", "3"], ["-dickson", "5"], ["-dickson", "6"], ["-dickson", "12"], ["-dickson", "30"],
                 ["-dickson", "60"]):
         add(f"poly/{opt[0][1:]}{opt[1]}", lambda R, opt=opt: compare(R, R.residues(1024, 2), "1000000000", opt))
+    # the root generation's affine steps (from 3073 bits, for degrees |S| <= 6): both sides in S
+    if maxbits >= 4096:
+        for opt in (["-power", "6"], ["-power", "7"], ["-dickson", "6"], ["-dickson", "12"]):
+            add(f"poly-4096/{opt[0][1:]}{opt[1]}",
+                lambda R, opt=opt: compare(R, R.residues(4096, 2), "100000000", opt))
     # blocks, tiny and degenerate B2, ranges, huge B2
     for k in ("1", "2", "7", "50"):
         add(f"k/{k}", lambda R, k=k: compare(R, R.residues(1024, 2), "100000000", ["-k", k]))

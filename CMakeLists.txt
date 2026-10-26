@@ -162,6 +162,9 @@ add_test(NAME roots COMMAND test_roots)
 add_executable(test_stage2 tests/test_stage2.cu)
 target_link_libraries(test_stage2 PRIVATE gpuecm2core)
 add_test(NAME stage2 COMMAND test_stage2)
+# the affine root steps (by default from 3073 bits on) at the small sizes of the tests too
+add_test(NAME stage2_affine COMMAND test_stage2)
+set_tests_properties(stage2_affine PROPERTIES ENVIRONMENT GPUECM2_AFFINE=3)
 add_executable(test_capi tests/test_capi.c)
 target_link_libraries(test_capi PRIVATE gpuecm2lib)
 add_test(NAME capi COMMAND test_capi)
@@ -173,6 +176,9 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME hits COMMAND Python3::Interpreter ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_hits.py $<TARGET_FILE:gpuecm2>)
   add_test(NAME hits_capi COMMAND Python3::Interpreter ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_hits.py
                                   $<TARGET_FILE:capi_resume>)
+  add_test(NAME hits_affine COMMAND Python3::Interpreter ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_hits.py
+                                    $<TARGET_FILE:gpuecm2>)
+  set_tests_properties(hits_affine PROPERTIES ENVIRONMENT GPUECM2_AFFINE=3)
   add_test(NAME input COMMAND Python3::Interpreter ${CMAKE_CURRENT_SOURCE_DIR}/tests/input_tests.py
                               $<TARGET_FILE:gpuecm2>)
 endif()

@@ -196,7 +196,8 @@ them concurrently was measured to be slower (docs/BENCHMARKS.md).
 
 [docs/TESTING.md](docs/TESTING.md) describes the tests. In short:
 
-- `ctest`: unit tests of every part, including the C interface (about a minute).
+- `ctest`: unit tests of every part, including the C interface and the known hits (2–3
+  minutes).
 - `python3 tests/run_hits.py build/gpuecm2`: known stage 2 factors from real factoring work
   (`tests/data/stage2_hits.txt`, and `tests/data/stage2_hits_large.txt` for 4609 to 32768
   bits) must be found again; no GMP-ECM needed.
